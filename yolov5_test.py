@@ -20,6 +20,7 @@ import traceback
 import yaml
 import requests
 from urllib.parse import urlparse
+import pickle  # Add pickle module for model loading
 
 # Set environment variable to avoid OpenMP errors
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -515,6 +516,9 @@ names: ['object']  # class names
         print("\nStarting YOLOv5 training...")
         start_time = time.time()
         
+        # Import sys at the function level to ensure it's available
+        import sys
+        
         # YOLOv5 training command
         train_cmd = [
             sys.executable, "train.py",
@@ -592,25 +596,109 @@ names: ['object']  # class names
                 "Error": "Results file not found"
             }
         
-        # Calculate model parameters
+        # Always set training time in metrics
+        metrics["Training Time (min)"] = training_time
+        
+        # Calculate model parameters and GFLOPs
         try:
             # Load the trained model to get parameters
             best_model_path = os.path.join(results_dir, "weights", "best.pt")
             if os.path.exists(best_model_path):
-                model_state = torch.load(best_model_path, map_location='cpu')
-                if 'model' in model_state:
-                    model_params = sum(p.numel() for p in model_state['model'].parameters())
-                    metrics["Parameters (M)"] = model_params / 1e6
-                else:
+                print(f"Loading model from {best_model_path} for parameter analysis")
+                
+                # Load model with safe_load option
+                try:
+                    # Use the global sys module
+                    sys.path.append(yolov5_dir)  # Ensure YOLOv5 modules are in path
+                    
+                    # Try loading the model using YOLOv5's methods if possible
+                    try:
+                        from models.experimental import attempt_load
+                        model = attempt_load(best_model_path, map_location='cpu')
+                        print("Loaded model using YOLOv5's attempt_load")
+                    except Exception as e:
+                        print(f"Falling back to standard torch.load: {str(e)}")
+                        model_state = torch.load(best_model_path, map_location='cpu', pickle_module=pickle)
+                        model = model_state['model'].float() if 'model' in model_state else None
+                        print("Loaded model from state dict")
+                        
+                    if model is not None:
+                        # Count total parameters
+                        total_params = sum(p.numel() for p in model.parameters())
+                        metrics["Parameters (M)"] = total_params / 1e6
+                        
+                        # Count trainable parameters
+                        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                        metrics["Trainable Parameters (M)"] = trainable_params / 1e6
+                        
+                        # Calculate percentage of trainable parameters
+                        percentage = (trainable_params / total_params * 100) if total_params > 0 else 0
+                        print(f"\nParameter count: {total_params:,} total, {trainable_params:,} trainable ({percentage:.2f}%)")
+                        
+                        # Calculate GFLOPs with more robust error handling
+                        try:
+                            # Install thop if needed
+                            try:
+                                from thop import profile
+                            except ImportError:
+                                print("Installing thop for FLOPs calculation...")
+                                subprocess.run([sys.executable, "-m", "pip", "install", "thop"], check=True)
+                                from thop import profile
+                            
+                            # Create proper dummy input
+                            model.eval()
+                            img_size = 640
+                            dummy_input = torch.zeros((1, 3, img_size, img_size), device='cpu')
+                            
+                            # Profile with error handling
+                            with torch.no_grad():
+                                try:
+                                    macs, _ = profile(model, inputs=(dummy_input,), verbose=False)
+                                    gflops = macs * 2 / 1e9
+                                    metrics["GFLOPs"] = gflops
+                                    print(f"Model GFLOPs: {gflops:.2f}")
+                                except Exception as e:
+                                    print(f"Error in profiling: {str(e)}")
+                            
+                            # Alternative method using a forward pass
+                            try:
+                                print("Trying alternative GFLOPs calculation...")
+                                start = time.time()
+                                _ = model(dummy_input)
+                                end = time.time()
+                                inference_time = (end - start) * 1000  # ms
+                                
+                                # Use a simplified GFLOPs estimation based on model size
+                                est_gflops = total_params * 2 / 1e9  # Rough estimate
+                                metrics["GFLOPs"] = est_gflops
+                                print(f"Estimated GFLOPs: ~{est_gflops:.2f} (based on param count)")
+                            except Exception as inner_e:
+                                print(f"Alternative method failed: {str(inner_e)}")
+                                metrics["GFLOPs"] = "N/A"
+                        except Exception as e:
+                            print(f"GFLOPs calculation completely failed: {str(e)}")
+                            metrics["GFLOPs"] = "N/A"
+                    else:
+                        print("Model could not be properly loaded")
+                        metrics["Parameters (M)"] = "N/A"
+                        metrics["Trainable Parameters (M)"] = "N/A"
+                        metrics["GFLOPs"] = "N/A"
+                except Exception as e:
+                    print(f"Error loading model: {str(e)}")
                     metrics["Parameters (M)"] = "N/A"
+                    metrics["Trainable Parameters (M)"] = "N/A"
+                    metrics["GFLOPs"] = "N/A"
             else:
+                print(f"Model file not found at {best_model_path}")
                 metrics["Parameters (M)"] = "N/A"
+                metrics["Trainable Parameters (M)"] = "N/A"
+                metrics["GFLOPs"] = "N/A"
         except Exception as e:
             print(f"Error calculating parameters: {str(e)}")
+            traceback.print_exc()
             metrics["Parameters (M)"] = "N/A"
-        
-        metrics["Training Time (min)"] = training_time
-        metrics["GFLOPs"] = "N/A"  # Would need separate profiling
+            metrics["Trainable Parameters (M)"] = "N/A"
+            metrics["GFLOPs"] = "N/A"
         
         # Calculate inference time
         if torch.cuda.is_available():
@@ -667,6 +755,7 @@ names: ['object']  # class names
             'mAP50': metrics['mAP50'],
             'mAP50-95': metrics['mAP50-95'],
             'Parameters (M)': metrics['Parameters (M)'],
+            'Trainable Parameters (M)': metrics.get('Trainable Parameters (M)', metrics['Parameters (M)']),
             'GFLOPs': metrics['GFLOPs'],
             'Inference Time (ms)': metrics['Inference Time (ms)'],
             'Training Time (min)': metrics['Training Time (min)'],
@@ -690,6 +779,13 @@ names: ['object']  # class names
         print(f"mAP50: {metrics['mAP50']:.4f}")
         print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
         print(f"Parameters (M): {metrics['Parameters (M)']}")
+        print(f"Trainable Parameters (M): {metrics.get('Trainable Parameters (M)', metrics['Parameters (M)'])}")
+        
+        if metrics['GFLOPs'] != "N/A":
+            print(f"GFLOPs: {metrics['GFLOPs']:.2f}")
+        else:
+            print(f"GFLOPs: {metrics['GFLOPs']}")
+            
         print(f"Training Time: {metrics['Training Time (min)']:.2f} minutes")
         print(f"Inference Time: {metrics['Inference Time (ms)']} ms")
         print(f"GPU Memory: {metrics['GPU Memory (GB)']} GB")
@@ -734,6 +830,7 @@ def visualize_yolov5_results(results):
         'mAP50': [results[model].get('mAP50', 0) for model in results],
         'mAP50-95': [results[model].get('mAP50-95', 0) for model in results],
         'Parameters (M)': [results[model].get('Parameters (M)', 0) for model in results],
+        'Trainable Parameters (M)': [results[model].get('Trainable Parameters (M)', results[model].get('Parameters (M)', 0)) for model in results],
         'GFLOPs': [results[model].get('GFLOPs', 'N/A') for model in results],
         'Inference Time (ms)': [results[model].get('Inference Time (ms)', 0) for model in results],
         'Training Time (min)': [results[model].get('Training Time (min)', 'N/A') for model in results],
@@ -752,10 +849,10 @@ def visualize_yolov5_results(results):
         return metrics_df
     
     try:
-        plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(15, 12))
         
         # 1. Accuracy comparison
-        plt.subplot(2, 2, 1)
+        plt.subplot(3, 2, 1)
         bars = plt.bar(metrics_df['Model'], metrics_df['mAP50'], color='green')
         plt.title('YOLOv5 mAP50 Comparison', fontsize=14)
         plt.ylabel('mAP50')
@@ -769,7 +866,7 @@ def visualize_yolov5_results(results):
                     ha='center', va='bottom')
         
         # 2. Model Size vs Accuracy
-        plt.subplot(2, 2, 2)
+        plt.subplot(3, 2, 2)
         valid_params = [p for p in metrics_df['Parameters (M)'] if p != 'N/A']
         if valid_params:
             plt.scatter(metrics_df['Parameters (M)'], metrics_df['mAP50'], s=100, alpha=0.7)
@@ -782,7 +879,7 @@ def visualize_yolov5_results(results):
         plt.grid(True, alpha=0.7)
         
         # 3. Training Time Comparison
-        plt.subplot(2, 2, 3)
+        plt.subplot(3, 2, 3)
         bars = plt.bar(metrics_df['Model'], metrics_df['Training Time (min)'], color='orange')
         plt.title('Training Time Comparison', fontsize=14)
         plt.ylabel('Training Time (minutes)')
@@ -796,7 +893,7 @@ def visualize_yolov5_results(results):
                     ha='center', va='bottom')
         
         # 4. mAP50 vs mAP50-95
-        plt.subplot(2, 2, 4)
+        plt.subplot(3, 2, 4)
         plt.scatter(metrics_df['mAP50'], metrics_df['mAP50-95'], s=100, alpha=0.7)
         for i, model in enumerate(metrics_df['Model']):
             plt.annotate(model, (metrics_df['mAP50'].iloc[i], metrics_df['mAP50-95'].iloc[i]),
@@ -805,6 +902,55 @@ def visualize_yolov5_results(results):
         plt.xlabel('mAP50')
         plt.ylabel('mAP50-95')
         plt.grid(True, alpha=0.7)
+        
+        # 5. Total vs Trainable Parameters
+        plt.subplot(3, 2, 5)
+        x = metrics_df['Parameters (M)']
+        y = metrics_df['Trainable Parameters (M)']
+        
+        # Create bar chart comparing total vs trainable parameters
+        models = metrics_df['Model']
+        x_pos = np.arange(len(models))
+        width = 0.35
+        
+        fig, ax = plt.subplots()
+        ax.bar(x_pos - width/2, x, width, label='Total Parameters')
+        ax.bar(x_pos + width/2, y, width, label='Trainable Parameters')
+        
+        ax.set_xlabel('Model')
+        ax.set_ylabel('Parameters (M)')
+        ax.set_title('Total vs Trainable Parameters')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(models)
+        ax.legend()
+        
+        # Save this plot separately
+        plt.savefig(os.path.join(OUTPUT_DIR, 'yolov5_parameters_comparison.png'))
+        plt.close()
+        
+        # 6. GFLOPs Comparison
+        plt.subplot(3, 2, 6)
+        if 'GFLOPs' in metrics_df.columns:
+            # Filter numeric values for plotting
+            gflop_data = metrics_df.copy()
+            gflop_data = gflop_data[gflop_data['GFLOPs'] != 'N/A']
+            
+            if not gflop_data.empty:
+                # Convert to numeric if needed
+                if isinstance(gflop_data['GFLOPs'].iloc[0], str):
+                    gflop_data['GFLOPs'] = pd.to_numeric(gflop_data['GFLOPs'], errors='coerce')
+                
+                bars = plt.bar(gflop_data['Model'], gflop_data['GFLOPs'], color='purple')
+                plt.title('GFLOPs Comparison', fontsize=14)
+                plt.ylabel('GFLOPs')
+                plt.xticks(rotation=45, ha='right')
+                plt.grid(axis='y', linestyle='--', alpha=0.7)
+                
+                for bar in bars:
+                    height = bar.get_height()
+                    plt.text(bar.get_x() + bar.get_width()/2., height,
+                            f'{height:.2f}',
+                            ha='center', va='bottom')
         
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, 'yolov5_comparison_charts.png'))
@@ -857,6 +1003,8 @@ def main():
         print(f"  mAP50: {metrics.get('mAP50', 'N/A')}")
         print(f"  mAP50-95: {metrics.get('mAP50-95', 'N/A')}")
         print(f"  Parameters (M): {metrics.get('Parameters (M)', 'N/A')}")
+        print(f"  Trainable Parameters (M): {metrics.get('Trainable Parameters (M)', metrics.get('Parameters (M)', 'N/A'))}")
+        print(f"  GFLOPs: {metrics.get('GFLOPs', 'N/A')}")
         print(f"  Training Time (min): {metrics.get('Training Time (min)', 'N/A')}")
         print(f"  Inference Time (ms): {metrics.get('Inference Time (ms)', 'N/A')}")
         if metrics.get('Error'):

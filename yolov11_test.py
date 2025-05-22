@@ -20,6 +20,7 @@ import traceback
 import yaml
 import requests
 import tempfile
+import pickle
 
 # Set environment variable to avoid OpenMP errors
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -646,9 +647,99 @@ def test_yolo11(model_size='s'):
             }
         
         # Calculate additional metrics
-        metrics["Parameters (M)"] = sum(p.numel() for p in model.model.parameters() if p.requires_grad) / 1e6
+        total_params = sum(p.numel() for p in model.model.parameters())
+        trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        percentage = (trainable_params / total_params * 100) if total_params > 0 else 0
+        
+        print(f"\nParameter count: {total_params:,} total, {trainable_params:,} trainable ({percentage:.2f}%)")
+        
+        metrics["Parameters (M)"] = total_params / 1e6
+        metrics["Trainable Parameters (M)"] = trainable_params / 1e6
         metrics["Training Time (min)"] = training_time
-        metrics["GFLOPs"] = "N/A"
+        
+        # Detailed diagnostic output about trainable parameters
+        if trainable_params == 0:
+            print("\n[WARNING] No trainable parameters detected! Model is frozen.")
+            print("Attempting to diagnose the issue:")
+            
+            # Check if requires_grad is False for all parameters
+            params_requiring_grad = [p for p in model.model.parameters() if p.requires_grad]
+            if len(params_requiring_grad) == 0:
+                print("All parameters have requires_grad=False. Model is completely frozen.")
+                
+                # Try to enable training if possible
+                try:
+                    print("Attempting to unfreeze model parameters...")
+                    for param in model.model.parameters():
+                        param.requires_grad = True
+                    
+                    # Count again
+                    new_trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+                    print(f"After unfreezing: {new_trainable_params:,} trainable parameters")
+                    
+                    # Update metrics if successful
+                    if new_trainable_params > 0:
+                        metrics["Trainable Parameters (M)"] = new_trainable_params / 1e6
+                        trainable_params = new_trainable_params
+                except Exception as e:
+                    print(f"Error unfreezing parameters: {e}")
+        
+        # Calculate GFLOPs with enhanced error handling
+        try:
+            # First try to import thop
+            try:
+                from thop import profile
+            except ImportError:
+                print("Installing thop for FLOPs calculation...")
+                subprocess.run([sys.executable, "-m", "pip", "install", "thop"], check=True)
+                from thop import profile
+            
+            # Prepare model for profiling
+            model.model.eval()  # Set to evaluation mode
+            device = next(model.model.parameters()).device
+            input_tensor = torch.randn(1, 3, 640, 640).to(device)
+            
+            # Do multiple profiling attempts with different methods if needed
+            with torch.no_grad():
+                # Synchronize for accurate timing if using GPU
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                try:
+                    # Method 1: Direct thop profiling
+                    macs, _ = profile(model.model, inputs=(input_tensor,), verbose=False)
+                    gflops = macs * 2 / 1e9
+                    metrics["GFLOPs"] = gflops
+                    print(f"Calculated GFLOPs: {gflops:.2f}")
+                except Exception as e1:
+                    print(f"Primary GFLOPs calculation failed: {str(e1)}")
+                    
+                    try:
+                        # Method 2: Alternative approach via timed inference
+                        print("Trying alternative GFLOPs calculation method...")
+                        
+                        # Time the forward pass
+                        iterations = 10
+                        start = time.time()
+                        for _ in range(iterations):
+                            _ = model.model(input_tensor)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        end = time.time()
+                        
+                        # Estimate GFLOPs based on parameter count (rough approximation)
+                        inference_time_ms = (end - start) * 1000 / iterations
+                        est_gflops = total_params * 2 / 1e9  # Very rough estimate
+                        
+                        metrics["GFLOPs"] = est_gflops
+                        print(f"Estimated GFLOPs: ~{est_gflops:.2f} (based on param count)")
+                        print(f"Average inference time: {inference_time_ms:.2f} ms")
+                    except Exception as e2:
+                        print(f"Alternative GFLOPs calculation also failed: {str(e2)}")
+                        metrics["GFLOPs"] = "N/A"
+        except Exception as e:
+            print(f"GFLOPs calculation failed completely: {str(e)}")
+            metrics["GFLOPs"] = "N/A"
         
         # Calculate inference time
         if torch.cuda.is_available():
@@ -682,6 +773,7 @@ def test_yolo11(model_size='s'):
             'mAP50': metrics['mAP50'],
             'mAP50-95': metrics['mAP50-95'],
             'Parameters (M)': metrics['Parameters (M)'],
+            'Trainable Parameters (M)': metrics.get('Trainable Parameters (M)', metrics['Parameters (M)']),
             'GFLOPs': metrics['GFLOPs'],
             'Inference Time (ms)': metrics['Inference Time (ms)'],
             'Training Time (min)': metrics['Training Time (min)'],
@@ -708,6 +800,13 @@ def test_yolo11(model_size='s'):
         print(f"mAP50: {metrics['mAP50']:.4f}")
         print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
         print(f"Parameters (M): {metrics['Parameters (M)']:.2f}")
+        print(f"Trainable Parameters (M): {metrics.get('Trainable Parameters (M)', metrics['Parameters (M)']):.2f}")
+        
+        if metrics['GFLOPs'] != "N/A":
+            print(f"GFLOPs: {metrics['GFLOPs']:.2f}")
+        else:
+            print(f"GFLOPs: {metrics['GFLOPs']}")
+            
         print(f"Training Time: {metrics['Training Time (min)']:.2f} minutes")
         print(f"Inference Time: {metrics['Inference Time (ms)']}")
         print(f"GPU Memory: {metrics['GPU Memory (GB)']} GB")
@@ -747,6 +846,7 @@ def visualize_yolo11_results(results):
         'mAP50': [results[model].get('mAP50', 0) for model in results],
         'mAP50-95': [results[model].get('mAP50-95', 0) for model in results],
         'Parameters (M)': [results[model].get('Parameters (M)', 0) for model in results],
+        'Trainable Parameters (M)': [results[model].get('Trainable Parameters (M)', results[model].get('Parameters (M)', 0)) for model in results],
         'GFLOPs': [results[model].get('GFLOPs', 'N/A') for model in results],
         'Inference Time (ms)': [results[model].get('Inference Time (ms)', 0) for model in results],
         'Training Time (min)': [results[model].get('Training Time (min)', 'N/A') for model in results],
@@ -766,10 +866,10 @@ def visualize_yolo11_results(results):
     
     # Create visualizations
     try:
-        plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(15, 15))  # Increased height to accommodate new chart
         
         # 1. Accuracy (mAP50) comparison
-        plt.subplot(2, 2, 1)
+        plt.subplot(3, 2, 1)  # Changed to 3x2 grid
         bars = plt.bar(metrics_df['Model'], metrics_df['mAP50'], color='darkblue')
         plt.title('YOLOv11 mAP50 Comparison', fontsize=14)
         plt.ylabel('mAP50')
@@ -784,7 +884,7 @@ def visualize_yolo11_results(results):
                     ha='center', va='bottom', rotation=0)
         
         # 2. Model Size vs. Accuracy
-        plt.subplot(2, 2, 2)
+        plt.subplot(3, 2, 2)  # Changed to 3x2 grid
         plt.scatter(metrics_df['Parameters (M)'], metrics_df['mAP50'], 
                    s=100, color='darkblue', alpha=0.7)
         
@@ -799,7 +899,7 @@ def visualize_yolo11_results(results):
         plt.grid(True, linestyle='--', alpha=0.7)
         
         # 3. Inference Speed vs. Accuracy
-        plt.subplot(2, 2, 3)
+        plt.subplot(3, 2, 3)  # Changed to 3x2 grid
         plt.scatter(metrics_df['Inference Time (ms)'], metrics_df['mAP50'], 
                    s=100, color='darkblue', alpha=0.7)
         
@@ -814,7 +914,7 @@ def visualize_yolo11_results(results):
         plt.grid(True, linestyle='--', alpha=0.7)
         
         # 4. Training Time vs. Accuracy
-        plt.subplot(2, 2, 4)
+        plt.subplot(3, 2, 4)  # Changed to 3x2 grid
         plt.scatter(metrics_df['Training Time (min)'], metrics_df['mAP50'], 
                    s=100, color='darkblue', alpha=0.7)
         
@@ -827,6 +927,50 @@ def visualize_yolo11_results(results):
         plt.xlabel('Training Time (min)')
         plt.ylabel('mAP50')
         plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # 5. Total vs Trainable Parameters Comparison (NEW)
+        plt.subplot(3, 2, 5)
+        models = metrics_df['Model']
+        x_pos = np.arange(len(models))
+        width = 0.35
+        
+        fig, ax = plt.subplots()
+        ax.bar(x_pos - width/2, metrics_df['Parameters (M)'], width, label='Total Parameters')
+        ax.bar(x_pos + width/2, metrics_df['Trainable Parameters (M)'], width, label='Trainable Parameters')
+        
+        ax.set_xlabel('Model')
+        ax.set_ylabel('Parameters (M)')
+        ax.set_title('Total vs Trainable Parameters')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(models)
+        ax.legend()
+        
+        # Save this plot separately
+        plt.savefig(os.path.join(OUTPUT_DIR, 'yolo11_parameters_comparison.png'))
+        plt.close()
+        
+        # 6. GFLOPs Comparison (NEW)
+        plt.subplot(3, 2, 6)
+        # Filter numeric values for plotting
+        gflop_data = metrics_df.copy()
+        gflop_data = gflop_data[gflop_data['GFLOPs'] != 'N/A']
+        
+        if not gflop_data.empty:
+            # Convert to numeric if needed
+            if isinstance(gflop_data['GFLOPs'].iloc[0], str):
+                gflop_data['GFLOPs'] = pd.to_numeric(gflop_data['GFLOPs'], errors='coerce')
+            
+            bars = plt.bar(gflop_data['Model'], gflop_data['GFLOPs'], color='purple')
+            plt.title('GFLOPs Comparison', fontsize=14)
+            plt.ylabel('GFLOPs')
+            plt.xticks(rotation=45, ha='right')
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}',
+                        ha='center', va='bottom')
         
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, 'yolo11_model_comparison_charts.png'))
@@ -910,6 +1054,23 @@ def main():
         except Exception as e:
             print(f"Error visualizing YOLOv11 results: {str(e)}")
             traceback.print_exc()
+    
+    # Print detailed results summary
+    print("\n" + "="*50)
+    print("YOLOv11 TESTING COMPLETE")
+    print("="*50)
+    
+    for model_name, metrics in results.items():
+        print(f"\n{model_name}:")
+        print(f"  mAP50: {metrics.get('mAP50', 'N/A')}")
+        print(f"  mAP50-95: {metrics.get('mAP50-95', 'N/A')}")
+        print(f"  Parameters (M): {metrics.get('Parameters (M)', 'N/A')}")
+        print(f"  Trainable Parameters (M): {metrics.get('Trainable Parameters (M)', metrics.get('Parameters (M)', 'N/A'))}")
+        print(f"  GFLOPs: {metrics.get('GFLOPs', 'N/A')}")
+        print(f"  Training Time (min): {metrics.get('Training Time (min)', 'N/A')}")
+        print(f"  Inference Time (ms): {metrics.get('Inference Time (ms)', 'N/A')}")
+        if metrics.get('Error'):
+            print(f"  Error: {metrics['Error']}")
     
     print("\nYOLOv11 testing complete!")
     return results

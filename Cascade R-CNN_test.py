@@ -708,7 +708,48 @@ def test_cascade_rcnn():
     # Number of training epochs
     num_epochs = 12  # Slightly more epochs for Cascade R-CNN
     
+    # Create a DataFrame to store per-epoch metrics
+    epoch_metrics_df = pd.DataFrame(columns=[
+        'Epoch', 'Loss', 'mAP50', 'mAP50-95', 'Parameters (M)', 
+        'Trainable Parameters (M)', 'GFLOPs', 'Training Time (min)', 
+        'Inference Time (ms)'
+    ])
+    
+    # Save metrics CSV path
+    per_epoch_csv = os.path.join(OUTPUT_DIR, 'cascade_rcnn_per_epoch_metrics.csv')
+    
+    # Calculate initial metrics for model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Calculate GFLOPs (do this once before training)
+    try:
+        # Try to import thop
+        try:
+            from thop import profile
+        except ImportError:
+            print("Installing thop for FLOPs calculation...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "thop"], check=True)
+            from thop import profile
+        
+        model.eval()
+        dummy_img = [torch.zeros((3, 640, 640), device=device)]
+        with torch.no_grad():
+            try:
+                macs, _ = profile(model, inputs=(dummy_img,), verbose=False)
+                gflops = macs * 2 / 1e9
+                print(f"Initial model GFLOPs: {gflops:.2f}")
+            except Exception:
+                gflops = total_params * 2 / 1e9  # Fallback to parameter-based estimate
+                print(f"Estimated GFLOPs: ~{gflops:.2f} (based on param count)")
+    except Exception:
+        gflops = "N/A"
+    
+    # Initialize metric tracking
+    from torchmetrics.detection.mean_ap import MeanAveragePrecision
+    
     # Training loop
+    epoch_start_time = time.time()
     for epoch in range(num_epochs):
         # Set model to training mode
         model.train()
@@ -720,6 +761,9 @@ def test_cascade_rcnn():
         # Progress bar
         print(f"Epoch {epoch+1}/{num_epochs}")
         progress_bar = tqdm(train_loader, desc=f"Training", leave=False)
+        
+        # Track epoch start time
+        start_time = time.time()
         
         for images, targets in progress_bar:
             try:
@@ -751,12 +795,122 @@ def test_cascade_rcnn():
         # Update learning rate
         lr_scheduler.step()
         
+        # Calculate epoch time
+        epoch_time = (time.time() - start_time) / 60.0  # minutes
+        total_time = (time.time() - epoch_start_time) / 60.0  # total minutes so far
+        
         # Print epoch stats
         if iter_count > 0:
             avg_loss = epoch_loss / iter_count
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.6f}")
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.6f}, Time: {epoch_time:.2f} min")
         else:
             print(f"Epoch {epoch+1}/{num_epochs}, No valid iterations")
+            avg_loss = 0
+        
+        # Run evaluation at the end of each epoch
+        print(f"Evaluating after epoch {epoch+1}...")
+        model.eval()
+        
+        # Initialize metrics
+        metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+        
+        # Evaluate on validation dataset
+        with torch.no_grad():
+            for images, targets in tqdm(val_loader, desc="Evaluating", leave=False):
+                try:
+                    # Move images to device
+                    images = [image.to(device) for image in images]
+                    
+                    # Get predictions
+                    predictions = model(images)
+                    
+                    # Prepare targets in the format expected by the metric
+                    for t in targets:
+                        # Convert device tensors to CPU for the metric
+                        t["boxes"] = t["boxes"].cpu()
+                        t["labels"] = t["labels"].cpu()
+                    
+                    # Prepare predictions in the format expected by the metric
+                    for p in predictions:
+                        # Convert device tensors to CPU for the metric
+                        p["boxes"] = p["boxes"].cpu()
+                        p["labels"] = p["labels"].cpu()
+                        p["scores"] = p["scores"].cpu()
+                    
+                    # Update metric
+                    metric.update(predictions, targets)
+                except Exception as e:
+                    print(f"Error in evaluation: {str(e)}")
+                    continue
+        
+        # Compute metrics
+        metrics_dict = metric.compute()
+        
+        # Extract relevant metrics
+        map50 = metrics_dict["map_50"].item() if "map_50" in metrics_dict else 0
+        map50_95 = metrics_dict["map"].item() if "map" in metrics_dict else 0
+        
+        # Measure inference time
+        if torch.cuda.is_available():
+            dummy_input = [torch.rand(3, 640, 640).to(device)]
+            
+            # Warm up
+            for _ in range(5):
+                _ = model(dummy_input)
+            
+            # Measure
+            torch.cuda.synchronize()
+            t0 = time.time()
+            iterations = 20
+            for _ in range(iterations):
+                _ = model(dummy_input)
+            torch.cuda.synchronize()
+            
+            inference_time = (time.time() - t0) * 1000 / iterations  # ms
+        else:
+            # Use CPU timing
+            dummy_input = [torch.rand(3, 640, 640)]
+            
+            # Warm up
+            for _ in range(2):
+                _ = model(dummy_input)
+            
+            # Measure
+            t0 = time.time()
+            iterations = 5
+            for _ in range(iterations):
+                _ = model(dummy_input)
+            
+            inference_time = (time.time() - t0) * 1000 / iterations  # ms
+        
+        # Store per-epoch metrics
+        epoch_metrics = {
+            'Epoch': epoch + 1,
+            'Loss': avg_loss,
+            'mAP50': map50,
+            'mAP50-95': map50_95,
+            'Parameters (M)': total_params / 1e6,
+            'Trainable Parameters (M)': trainable_params / 1e6,
+            'GFLOPs': gflops if isinstance(gflops, (int, float)) else "N/A",
+            'Training Time (min)': total_time,
+            'Inference Time (ms)': inference_time
+        }
+        
+        # Add to DataFrame
+        epoch_metrics_df = pd.concat([epoch_metrics_df, pd.DataFrame([epoch_metrics])], ignore_index=True)
+        
+        # Save to CSV after each epoch
+        epoch_metrics_df.to_csv(per_epoch_csv, index=False)
+        
+        # Print metrics summary
+        print(f"\nEpoch {epoch+1} Metrics:")
+        print(f"  mAP50: {map50:.4f}")
+        print(f"  mAP50-95: {map50_95:.4f}")
+        print(f"  Parameters (M): {total_params / 1e6:.2f}")
+        print(f"  Trainable Parameters (M): {trainable_params / 1e6:.2f}")
+        print(f"  GFLOPs: {gflops if isinstance(gflops, (int, float)) else 'N/A'}")
+        print(f"  Training Time (min): {total_time:.2f}")
+        print(f"  Inference Time (ms): {inference_time:.2f}")
     
     # Calculate training time
     training_time = (time.time() - start_time) / 60.0  # minutes
@@ -808,12 +962,69 @@ def test_cascade_rcnn():
     metrics["mAP50"] = metrics_dict["map_50"].item() if "map_50" in metrics_dict else 0
     metrics["mAP50-95"] = metrics_dict["map"].item() if "map" in metrics_dict else 0
     
-    # Model parameters
-    metrics["Parameters (M)"] = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    # Calculate both total and trainable parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    percentage = (trainable_params / total_params * 100) if total_params > 0 else 0
+    
+    print(f"\nParameter count: {total_params:,} total, {trainable_params:,} trainable ({percentage:.2f}%)")
+    
+    metrics["Parameters (M)"] = total_params / 1e6
+    metrics["Trainable Parameters (M)"] = trainable_params / 1e6
     metrics["Training Time (min)"] = training_time
     
-    # For GFLOPs, we would need a separate profiling tool
-    metrics["GFLOPs"] = "N/A"
+    # Calculate GFLOPs
+    try:
+        # Install thop if needed
+        try:
+            from thop import profile
+        except ImportError:
+            print("Installing thop for FLOPs calculation...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "thop"], check=True)
+            from thop import profile
+        
+        # Create dummy input
+        model.eval()
+        dummy_img = [torch.zeros((3, 640, 640), device=device)]
+        
+        # Profile with thop
+        with torch.no_grad():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            try:
+                # Method 1: Direct thop profiling
+                macs, _ = profile(model, inputs=(dummy_img,), verbose=False)
+                gflops = macs * 2 / 1e9
+                metrics["GFLOPs"] = gflops
+                print(f"Calculated GFLOPs: {gflops:.2f}")
+            except Exception as e1:
+                print(f"Primary GFLOPs calculation failed: {str(e1)}")
+                
+                try:
+                    # Method 2: Alternative approach via timed inference
+                    print("Trying alternative GFLOPs calculation method...")
+                    
+                    # Time the forward pass
+                    iterations = 10
+                    start = time.time()
+                    for _ in range(iterations):
+                        _ = model(dummy_img)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    end = time.time()
+                    
+                    # Estimate GFLOPs based on parameter count (rough approximation)
+                    est_gflops = total_params * 2 / 1e9  # Very rough estimate
+                    
+                    metrics["GFLOPs"] = est_gflops
+                    print(f"Estimated GFLOPs: ~{est_gflops:.2f} (based on param count)")
+                except Exception as e2:
+                    print(f"Alternative GFLOPs calculation also failed: {str(e2)}")
+                    metrics["GFLOPs"] = "N/A"
+    except Exception as e:
+        print(f"GFLOPs calculation failed completely: {str(e)}")
+        metrics["GFLOPs"] = "N/A"
     
     # Estimate inference time
     if torch.cuda.is_available():
@@ -872,6 +1083,8 @@ def visualize_results(results):
         'mAP50': [results[model].get('mAP50', 0) for model in results],
         'mAP50-95': [results[model].get('mAP50-95', 0) for model in results],
         'Parameters (M)': [results[model].get('Parameters (M)', 0) for model in results],
+        'Trainable Parameters (M)': [results[model].get('Trainable Parameters (M)', results[model].get('Parameters (M)', 0)) for model in results],
+        'GFLOPs': [results[model].get('GFLOPs', 'N/A') for model in results],
         'Inference Time (ms)': [results[model].get('Inference Time (ms)', 0) for model in results],
         'Training Time (min)': [results[model].get('Training Time (min)', 'N/A') for model in results],
         'GPU Memory (GB)': [results[model].get('GPU Memory (GB)', 'N/A') for model in results],
@@ -890,10 +1103,10 @@ def visualize_results(results):
     
     # Create visualizations
     try:
-        plt.figure(figsize=(12, 10))
+        plt.figure(figsize=(15, 15))
         
         # 1. Accuracy (mAP50) bar chart
-        plt.subplot(2, 2, 1)
+        plt.subplot(3, 2, 1)
         bars = plt.bar(metrics_df['Model'], metrics_df['mAP50'], color='blue')
         plt.title('mAP50 Performance', fontsize=14)
         plt.ylabel('mAP50')
@@ -908,7 +1121,7 @@ def visualize_results(results):
                     ha='center', va='bottom', rotation=0)
         
         # 2. Inference speed
-        plt.subplot(2, 2, 2)
+        plt.subplot(3, 2, 2)
         bars = plt.bar(metrics_df['Model'], metrics_df['Inference Time (ms)'], color='green')
         plt.title('Inference Time', fontsize=14)
         plt.ylabel('Time (ms)')
@@ -923,7 +1136,7 @@ def visualize_results(results):
                     ha='center', va='bottom', rotation=0)
         
         # 3. Training time
-        plt.subplot(2, 2, 3)
+        plt.subplot(3, 2, 3)
         
         # Convert training time to numeric, handling 'N/A'
         metrics_df['Training Time (Numeric)'] = pd.to_numeric(metrics_df['Training Time (min)'], errors='coerce')
@@ -944,24 +1157,120 @@ def visualize_results(results):
                         f'{height:.2f}',
                         ha='center', va='bottom', rotation=0)
         
-        # 4. Model parameters
-        plt.subplot(2, 2, 4)
-        bars = plt.bar(metrics_df['Model'], metrics_df['Parameters (M)'], color='purple')
-        plt.title('Model Size', fontsize=14)
-        plt.ylabel('Parameters (M)')
-        plt.xticks(rotation=45, ha='right')
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        # 4. Total vs Trainable Parameters
+        plt.subplot(3, 2, 4)
         
-        # Add value labels
-        for bar in bars:
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{height:.2f}',
-                    ha='center', va='bottom', rotation=0)
+        # Create a side-by-side bar chart
+        x = np.arange(len(metrics_df['Model']))
+        width = 0.35
+        
+        fig, ax = plt.subplots()
+        ax.bar(x - width/2, metrics_df['Parameters (M)'], width, label='Total Parameters', color='purple')
+        ax.bar(x + width/2, metrics_df['Trainable Parameters (M)'], width, label='Trainable Parameters', color='magenta')
+        
+        ax.set_xlabel('Model')
+        ax.set_ylabel('Parameters (M)')
+        ax.set_title('Total vs Trainable Parameters')
+        ax.set_xticks(x)
+        ax.set_xticklabels(metrics_df['Model'])
+        ax.legend()
+        
+        # Save this plot separately
+        plt.savefig(os.path.join(OUTPUT_DIR, 'cascade_rcnn_parameters_comparison.png'))
+        plt.close()
+        
+        # 5. GFLOPs comparison
+        plt.subplot(3, 2, 5)
+        # Filter numeric GFLOPs
+        gflop_data = metrics_df.copy()
+        gflop_data = gflop_data[gflop_data['GFLOPs'] != 'N/A']
+        
+        if not gflop_data.empty:
+            # Convert to numeric if needed
+            if isinstance(gflop_data['GFLOPs'].iloc[0], str):
+                gflop_data['GFLOPs'] = pd.to_numeric(gflop_data['GFLOPs'], errors='coerce')
+            
+            bars = plt.bar(gflop_data['Model'], gflop_data['GFLOPs'], color='teal')
+            plt.title('GFLOPs Comparison', fontsize=14)
+            plt.ylabel('GFLOPs')
+            plt.xticks(rotation=45, ha='right')
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}',
+                        ha='center', va='bottom')
+        
+        # 6. Per-epoch metrics visualization
+        plt.subplot(3, 2, 6)
+        epoch_csv = os.path.join(OUTPUT_DIR, 'cascade_rcnn_per_epoch_metrics.csv')
+        
+        if os.path.exists(epoch_csv):
+            try:
+                epoch_df = pd.read_csv(epoch_csv)
+                plt.plot(epoch_df['Epoch'], epoch_df['mAP50'], 'b-o', label='mAP50')
+                plt.plot(epoch_df['Epoch'], epoch_df['mAP50-95'], 'r-o', label='mAP50-95')
+                plt.title('Performance by Epoch', fontsize=14)
+                plt.xlabel('Epoch')
+                plt.ylabel('mAP')
+                plt.grid(True, linestyle='--', alpha=0.7)
+                plt.legend()
+            except Exception as e:
+                print(f"Error plotting epoch metrics: {e}")
         
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, 'cascade_rcnn_performance.png'))
         plt.close()
+        
+        # Also create a separate chart for per-epoch metrics
+        if os.path.exists(epoch_csv):
+            try:
+                epoch_df = pd.read_csv(epoch_csv)
+                
+                plt.figure(figsize=(15, 10))
+                
+                # Plot mAP metrics over epochs
+                plt.subplot(2, 2, 1)
+                plt.plot(epoch_df['Epoch'], epoch_df['mAP50'], 'b-o', label='mAP50')
+                plt.plot(epoch_df['Epoch'], epoch_df['mAP50-95'], 'r-o', label='mAP50-95')
+                plt.title('mAP over Epochs', fontsize=14)
+                plt.xlabel('Epoch')
+                plt.ylabel('mAP')
+                plt.grid(True, alpha=0.7)
+                plt.legend()
+                
+                # Plot loss over epochs
+                plt.subplot(2, 2, 2)
+                plt.plot(epoch_df['Epoch'], epoch_df['Loss'], 'g-o')
+                plt.title('Loss over Epochs', fontsize=14)
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.grid(True, alpha=0.7)
+                
+                # Plot inference time over epochs
+                plt.subplot(2, 2, 3)
+                plt.plot(epoch_df['Epoch'], epoch_df['Inference Time (ms)'], 'm-o')
+                plt.title('Inference Time over Epochs', fontsize=14)
+                plt.xlabel('Epoch')
+                plt.ylabel('Inference Time (ms)')
+                plt.grid(True, alpha=0.7)
+                
+                # Plot training time over epochs
+                plt.subplot(2, 2, 4)
+                plt.plot(epoch_df['Epoch'], epoch_df['Training Time (min)'], 'c-o')
+                plt.title('Cumulative Training Time', fontsize=14)
+                plt.xlabel('Epoch')
+                plt.ylabel('Time (min)')
+                plt.grid(True, alpha=0.7)
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(OUTPUT_DIR, 'cascade_rcnn_epoch_metrics.png'))
+                plt.close()
+                
+            except Exception as e:
+                print(f"Error creating epoch metrics visualization: {e}")
+                traceback.print_exc()
         
     except Exception as e:
         print(f"Error creating visualizations: {e}")

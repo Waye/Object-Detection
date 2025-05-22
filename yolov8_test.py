@@ -682,7 +682,7 @@ def test_yolov8(model_size='s'):
                 split_data = json.load(f)
             
             print(f"Loaded {len(split_data['images'])} images and {len(split_data['annotations'])} annotations for {split}")
-            
+        
             # Create image to annotation mapping
             image_annotations = {}
             for ann in split_data['annotations']:
@@ -690,7 +690,7 @@ def test_yolov8(model_size='s'):
                 if img_id not in image_annotations:
                     image_annotations[img_id] = []
                 image_annotations[img_id].append(ann)
-            
+    
             # Process each image
             for img in split_data['images']:
                 img_id = img['id']
@@ -707,7 +707,7 @@ def test_yolov8(model_size='s'):
                 # Copy image to dataset
                 dst_img = os.path.join(dataset_root, split, 'images', img_file)
                 shutil.copy2(src_img, dst_img)
-                
+    
                 # Create YOLO format label file
                 label_file = os.path.join(dataset_root, split, 'labels', 
                                         os.path.splitext(img_file)[0] + '.txt')
@@ -727,7 +727,7 @@ def test_yolov8(model_size='s'):
                             
                             # Always use class 0 for single class detection
                             f.write(f"0 {x_center} {y_center} {width} {height}\n")
-            
+    
             # Verify the conversion
             n_images = len(glob.glob(os.path.join(dataset_root, split, 'images', '*')))
             n_labels = len(glob.glob(os.path.join(dataset_root, split, 'labels', '*.txt')))
@@ -760,6 +760,28 @@ def test_yolov8(model_size='s'):
         else:
             model = YOLO(f'{model_name}.pt')
             print(f"Loaded {model_name} model")
+            
+        # Check model trainability before training
+        total_params_before = sum(p.numel() for p in model.model.parameters())
+        trainable_params_before = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        percentage = (trainable_params_before / total_params_before * 100) if total_params_before > 0 else 0
+        
+        print(f"\nBefore training: {total_params_before:,} total, {trainable_params_before:,} trainable ({percentage:.2f}%)")
+        
+        # Ensure parameters are trainable
+        if trainable_params_before == 0:
+            print("WARNING: No trainable parameters detected. Enabling training mode...")
+            # Attempt to set requires_grad to True for all parameters
+            for param in model.model.parameters():
+                param.requires_grad = True
+            
+            # Check if that worked
+            trainable_params_after = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+            if trainable_params_after > 0:
+                print(f"Successfully enabled training for {trainable_params_after:,} parameters")
+            else:
+                print("Could not enable training parameters - may be in inference-only mode")
+                
     except Exception as e:
         print(f"Error loading model: {str(e)}")
         return {"mAP50": 0, "mAP50-95": 0, "Error": f"Model loading error: {str(e)}"}
@@ -769,6 +791,115 @@ def test_yolov8(model_size='s'):
         print("\nStarting training...")
         start_time = time.time()  # Start timing
         
+        # Calculate and print model parameters before training
+        num_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        params_millions = num_params / 1e6
+        print(f"\nModel Parameters: {params_millions:.2f}M")
+        
+        # Calculate GFLOPs (for 640x640 input)
+        try:
+            from thop import profile
+            device = next(model.model.parameters()).device  # Get model's device
+            input_tensor = torch.randn(1, 3, 640, 640).to(device)
+            model.model.to(device)  # Ensure model is on same device as input
+            
+            # Ensure model is in eval mode for proper profiling
+            model.model.eval()
+            
+            # Disable gradients for faster profiling
+            with torch.no_grad():
+                # Run a warm-up pass
+                _ = model.model(input_tensor)
+                
+                # Use torch.cuda.synchronize() if available to ensure accurate timing
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # Profile with thop
+                macs, params = profile(model.model, inputs=(input_tensor,), verbose=False)
+                
+                # Verify parameters count matches actual model parameters
+                actual_params = sum(p.numel() for p in model.model.parameters())
+                if abs(params - actual_params) > 1000:  # Allow small differences
+                    print(f"Warning: Parameter count mismatch: thop={params}, actual={actual_params}")
+                    params = actual_params
+                
+                gflops = macs * 2 / 1e9  # Convert MACs to GFLOPs
+                print(f"Model GFLOPs: {gflops:.2f}")
+                print(f"Model Parameters: {params:,} ({params/1e6:.2f}M)\n")
+        except ImportError:
+            print("Installing thop for FLOPs calculation...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "thop"], check=True)
+            from thop import profile
+            device = next(model.model.parameters()).device
+            input_tensor = torch.randn(1, 3, 640, 640).to(device)
+            model.model.to(device)
+            model.model.eval()
+            
+            with torch.no_grad():
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                macs, params = profile(model.model, inputs=(input_tensor,), verbose=False)
+                gflops = macs * 2 / 1e9
+                print(f"Model GFLOPs: {gflops:.2f}")
+                print(f"Model Parameters: {params:,} ({params/1e6:.2f}M)\n")
+        except Exception as e:
+            print(f"Could not calculate GFLOPs: {str(e)}")
+            traceback.print_exc()
+            gflops = 0
+            params = sum(p.numel() for p in model.model.parameters())
+            print(f"Fallback parameter count: {params:,} ({params/1e6:.2f}M)")
+        
+        # Add metrics to results.csv after training
+        def save_metrics_to_csv(metrics_dict):
+            results_dir = os.path.join(yolo_output, 'train')
+            results_file = os.path.join(results_dir, 'results.csv')
+            
+            # Create results directory if it doesn't exist
+            os.makedirs(results_dir, exist_ok=True)
+            
+            # Prepare metrics row with new columns
+            metrics_row = {
+                'epoch': metrics_dict.get('epoch', 0),
+                'train/box_loss': metrics_dict.get('train/box_loss', 0),
+                'train/cls_loss': metrics_dict.get('train/cls_loss', 0),
+                'train/dfl_loss': metrics_dict.get('train/dfl_loss', 0),
+                'metrics/precision(B)': metrics_dict.get('metrics/precision(B)', 0),
+                'metrics/recall(B)': metrics_dict.get('metrics/recall(B)', 0),
+                'metrics/mAP50(B)': metrics_dict.get('metrics/mAP50(B)', 0),
+                'metrics/mAP50-95(B)': metrics_dict.get('metrics/mAP50-95(B)', 0),
+                'val/box_loss': metrics_dict.get('val/box_loss', 0),
+                'val/cls_loss': metrics_dict.get('val/cls_loss', 0),
+                'val/dfl_loss': metrics_dict.get('val/dfl_loss', 0),
+                'params(M)': params_millions,
+                'gflops': gflops
+            }
+            
+            # Write to CSV
+            if not os.path.exists(results_file):
+                pd.DataFrame([metrics_row]).to_csv(results_file, index=False)
+            else:
+                pd.DataFrame([metrics_row]).to_csv(results_file, mode='a', header=False, index=False)
+        
+        # Ensure model is in training mode and parameters are trainable
+        model.model.train()
+        
+        # Check trainable parameters right before training
+        trainable_before_train = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        print(f"Trainable parameters right before training: {trainable_before_train:,} ({trainable_before_train/1e6:.2f}M)")
+        
+        # If still no trainable parameters, try to enable them at the lowest level
+        if trainable_before_train == 0:
+            print("WARNING: Still no trainable parameters. Making one last attempt to enable them...")
+            for module in model.model.modules():
+                for param in module.parameters(recurse=False):
+                    param.requires_grad = True
+                    
+            # Final check
+            trainable_after_fix = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+            print(f"Trainable parameters after fix: {trainable_after_fix:,} ({trainable_after_fix/1e6:.2f}M)")
+            
+        # Train the model without custom callbacks
         results = model.train(
             data=yaml_path,
             epochs=30,
@@ -815,6 +946,15 @@ def test_yolov8(model_size='s'):
             copy_paste=0.0,
         )
         
+        # After training, save final metrics
+        if hasattr(results, 'results_dict'):
+            save_metrics_to_csv(results.results_dict)
+        
+        # Check trainable parameters after training
+        trainable_after_train = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        total_after_train = sum(p.numel() for p in model.model.parameters())
+        print(f"\nAfter training: {total_after_train:,} total, {trainable_after_train:,} trainable ({trainable_after_train/total_after_train*100:.2f}%)")
+        
         # Calculate training time
         training_time = (time.time() - start_time) / 60.0  # Convert to minutes
         
@@ -853,10 +993,50 @@ def test_yolov8(model_size='s'):
                 "Error": f"Metric extraction error: {str(e)}"
             }
         
-        # Calculate additional metrics
-        metrics["Parameters (M)"] = sum(p.numel() for p in model.model.parameters() if p.requires_grad) / 1e6
+        # Calculate additional metrics - ensure we count ALL parameters, not just trainable ones
+        total_params = sum(p.numel() for p in model.model.parameters())
+        trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        
+        metrics["Parameters (M)"] = total_params / 1e6
+        metrics["Trainable Parameters (M)"] = trainable_params / 1e6
         metrics["Training Time (min)"] = training_time
-        metrics["GFLOPs"] = "N/A"  # Would need separate profiling
+        
+        # Check if there are trainable parameters and report
+        total_params = sum(p.numel() for p in model.model.parameters())
+        trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+        percentage = (trainable_params / total_params * 100) if total_params > 0 else 0
+        
+        print(f"\nParameter count: {total_params:,} total, {trainable_params:,} trainable ({percentage:.2f}%)")
+        if trainable_params == 0:
+            print("WARNING: No trainable parameters! The model is likely in inference mode only.")
+            
+            # Check if we can determine why parameters aren't trainable
+            for name, param in model.model.named_parameters():
+                if not param.requires_grad:
+                    print(f"Parameter {name} is frozen (requires_grad=False)")
+                else:
+                    print(f"Parameter {name} is trainable (requires_grad=True)")
+                # Only show first few
+                if name.count('.') < 2:  # Only show top-level parameters
+                    print(f"Top level parameter {name}: requires_grad={param.requires_grad}")
+        
+        # Add GFLOPs calculation - need to put model in eval mode for accurate measurement
+        try:
+            from thop import profile
+            model.model.eval()  # Set to evaluation mode
+            device = next(model.model.parameters()).device
+            input_tensor = torch.randn(1, 3, 640, 640).to(device)
+            
+            with torch.no_grad():
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                macs, _ = profile(model.model, inputs=(input_tensor,), verbose=False)
+                gflops = macs * 2 / 1e9
+                metrics["GFLOPs"] = gflops
+                print(f"Calculated GFLOPs: {gflops:.2f}")
+        except Exception as e:
+            print(f"Error calculating GFLOPs: {str(e)}")
+            metrics["GFLOPs"] = None
         
         # Calculate inference time
         if torch.cuda.is_available():
@@ -890,6 +1070,7 @@ def test_yolov8(model_size='s'):
             'mAP50': metrics['mAP50'],
             'mAP50-95': metrics['mAP50-95'],
             'Parameters (M)': metrics['Parameters (M)'],
+            'Trainable Parameters (M)': metrics.get('Trainable Parameters (M)', metrics['Parameters (M)']),
             'GFLOPs': metrics['GFLOPs'],
             'Inference Time (ms)': metrics['Inference Time (ms)'],
             'Training Time (min)': metrics['Training Time (min)'],
@@ -916,6 +1097,9 @@ def test_yolov8(model_size='s'):
         print(f"mAP50: {metrics['mAP50']:.4f}")
         print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
         print(f"Parameters (M): {metrics['Parameters (M)']:.2f}")
+        print(f"Trainable Parameters (M): {metrics.get('Trainable Parameters (M)', metrics['Parameters (M)']):.2f}")
+        if metrics.get('GFLOPs') is not None:
+            print(f"GFLOPs: {metrics['GFLOPs']:.2f}")
         print(f"Training Time: {metrics['Training Time (min)']:.2f} minutes")
         print(f"Inference Time: {metrics['Inference Time (ms)']}")
         print(f"GPU Memory: {metrics['GPU Memory (GB)']} GB")
@@ -959,13 +1143,19 @@ def run_all_tests():
 
 def visualize_results(results):
     """Create visualization of model performance"""
+    # Convert GFLOPs to numeric values where possible
+    for model in results:
+        if isinstance(results[model].get('GFLOPs'), str) and results[model].get('GFLOPs') == 'N/A':
+            results[model]['GFLOPs'] = None
+    
     # Create DataFrame from results
     metrics_df = pd.DataFrame({
         'Model': list(results.keys()),
         'mAP50': [results[model].get('mAP50', 0) for model in results],
         'mAP50-95': [results[model].get('mAP50-95', 0) for model in results],
         'Parameters (M)': [results[model].get('Parameters (M)', 0) for model in results],
-        'GFLOPs': [results[model].get('GFLOPs', 'N/A') for model in results],
+        'Trainable Parameters (M)': [results[model].get('Trainable Parameters (M)', results[model].get('Parameters (M)', 0)) for model in results],
+        'GFLOPs': [results[model].get('GFLOPs', None) for model in results],
         'Inference Time (ms)': [results[model].get('Inference Time (ms)', 0) for model in results],
         'Training Time (min)': [results[model].get('Training Time (min)', 'N/A') for model in results],
         'GPU Memory (GB)': [results[model].get('GPU Memory (GB)', 'N/A') for model in results],
@@ -1080,7 +1270,7 @@ def visualize_results(results):
             models = architecture_groups[arch]
             subset = metrics_df[metrics_df['Model'].isin(models)]
             if not subset.empty and 'GFLOPs' in subset.columns:
-                valid_rows = subset[subset['GFLOPs'] != 'N/A']
+                valid_rows = subset[pd.to_numeric(subset['GFLOPs'], errors='coerce').notna()]
                 if not valid_rows.empty:
                     plt.scatter(
                         valid_rows['GFLOPs'], 
@@ -1106,12 +1296,50 @@ def visualize_results(results):
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.legend()
         
+        # Create additional figure for parameter efficiency
+        plt.figure(figsize=(15, 8))
+        
+        # Total vs Trainable Parameters comparison
+        for arch in architecture_groups:
+            models = architecture_groups[arch]
+            subset = metrics_df[metrics_df['Model'].isin(models)]
+            if not subset.empty:
+                x_pos = np.arange(len(subset))
+                width = 0.35
+                
+                # Create bar chart
+                ax = plt.subplot(1, 1, 1)
+                ax.bar(x_pos - width/2, subset['Parameters (M)'], width, label='Total Parameters')
+                ax.bar(x_pos + width/2, subset['Trainable Parameters (M)'], width, label='Trainable Parameters')
+                
+                # Add model names as x-labels
+                plt.xticks(x_pos, subset['Model'])
+                
+                # Add value labels on top of bars
+                for i, (total, trainable) in enumerate(zip(subset['Parameters (M)'], subset['Trainable Parameters (M)'])):
+                    plt.text(i - width/2, total + 0.5, f'{total:.1f}M', ha='center')
+                    plt.text(i + width/2, trainable + 0.5, f'{trainable:.1f}M', ha='center')
+                
+                plt.title('Total vs Trainable Parameters', fontsize=14)
+                plt.ylabel('Parameters (M)')
+                plt.grid(axis='y', linestyle='--', alpha=0.7)
+                plt.legend()
+                
+                # Add efficiency percentage as text
+                for i, (model, total, trainable) in enumerate(zip(subset['Model'], subset['Parameters (M)'], subset['Trainable Parameters (M)'])):
+                    efficiency = (trainable / total) * 100 if total > 0 else 0
+                    plt.text(i, max(total, trainable) + 2, f'{efficiency:.1f}% trainable', ha='center')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, 'parameter_efficiency.png'))
+        plt.close()
+        
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, 'model_comparison_charts.png'))
         plt.close()
         
         # Create a radar chart for multi-metric comparison
-        metrics_to_plot = ['mAP50', 'Parameters (M)', 'Inference Time (ms)', 'GFLOPs']
+        metrics_to_plot = ['mAP50', 'Parameters (M)', 'Trainable Parameters (M)', 'Inference Time (ms)', 'GFLOPs']
         
         # Select best model from each architecture for radar chart
         best_models = []
@@ -1151,13 +1379,28 @@ def visualize_results(results):
                     else:
                         radar_df[f'{metric}_norm'] = 0
             
-            # Create radar chart
+                            # Create radar chart
             plt.figure(figsize=(10, 10))
             from matplotlib.path import Path
             from matplotlib.spines import Spine
             from matplotlib.transforms import Affine2D
             
-            # Number of variables
+            # Number of variables - ensure we only use metrics that have valid numeric data
+            valid_metrics = []
+            for metric in metrics_to_plot:
+                # Check if we have at least one valid value for this metric
+                if any(pd.to_numeric(radar_df_numeric[metric], errors='coerce').notna()):
+                    valid_metrics.append(metric)
+                else:
+                    print(f"Skipping metric {metric} in radar chart due to no valid data")
+            
+            # If we have no valid metrics, skip radar chart
+            if not valid_metrics:
+                print("No valid metrics for radar chart")
+                return metrics_df
+                
+            # Use only valid metrics
+            metrics_to_plot = valid_metrics
             N = len(metrics_to_plot)
             
             # What will be the angle of each axis in the plot
@@ -1418,10 +1661,11 @@ def main():
     # Define models to test - only YOLOv8-small
     tests = {
         "yolov8s": lambda: test_yolov8('s'),
+        "yolov8m": lambda: test_yolov8('m'),
     }
     
     # For debugging, you can add specific models to test
-    selected_tests = ["yolov8s"]  # Only YOLOv8-small
+    selected_tests = ["yolov8s", "yolov8m"]  # Run both YOLOv8-small and YOLOv8-medium
     
     print("Running selected tests...")
     
