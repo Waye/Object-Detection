@@ -1,5 +1,5 @@
-# Comprehensive Thermal Model Testing Framework
-# Testing YOLOv5 Models on FLIR Thermal Dataset
+# YOLOv5 Thermal Model Testing Framework
+# Testing YOLOv5s and YOLOv5m Models on FLIR Thermal Dataset
 
 import os
 import json
@@ -14,9 +14,12 @@ import shutil
 from datetime import datetime
 import time
 import glob
-from tqdm import tqdm  # Using standard tqdm instead of notebook version
+from tqdm import tqdm
 import sys
 import traceback
+import yaml
+import requests
+from urllib.parse import urlparse
 
 # Set environment variable to avoid OpenMP errors
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -25,7 +28,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 DATA_DIR = os.path.join(os.getcwd(), "data")
 OUTPUT_DIR = os.path.join(os.getcwd(), "results")
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
-ANNOTATIONS_FILE = os.path.join(os.getcwd(), "instances_train.json")  # Define annotation file path
+ANNOTATIONS_FILE = os.path.join(DATA_DIR, "annotations.json")
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -37,47 +40,105 @@ print(f"Images directory: {IMAGE_DIR}")
 print(f"Output directory: {OUTPUT_DIR}")
 
 # Global variables to track dataset and model preparation
-# These MUST be at module level and initialized only once
 DATASET_PREPARED = False
 MODELS_DOWNLOADED = False
-YOLO_MODELS = {}  # Dictionary to store preloaded models
-filtered_coco_data = None  # Global variable to store the filtered data
+YOLOV5_MODELS = {}
+filtered_coco_data = None
 
-# Define annotation file paths
-train_annot_file = os.path.join(OUTPUT_DIR, "train_annotations.json")
-val_annot_file = os.path.join(OUTPUT_DIR, "val_annotations.json")
-filtered_annot_file = os.path.join(OUTPUT_DIR, "filtered_annotations.json")
+# YOLOv5 model URLs
+YOLOV5_MODEL_URLS = {
+    'yolov5s': 'https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt',
+    'yolov5m': 'https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5m.pt'
+}
 
-# Function to download all models at once
-def download_all_models():
-    """Download all required YOLO models in advance"""
-    global MODELS_DOWNLOADED, YOLO_MODELS
+def download_file(url, filename):
+    """Download a file from URL"""
+    print(f"Downloading {filename} from {url}")
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        with open(filename, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        print(f"Successfully downloaded {filename}")
+        return True
+    except Exception as e:
+        print(f"Error downloading {filename}: {str(e)}")
+        return False
+
+def setup_yolov5_environment():
+    """Setup YOLOv5 environment"""
+    yolov5_dir = os.path.join(os.getcwd(), "yolov5")
+    
+    # Check if YOLOv5 directory exists
+    if not os.path.exists(yolov5_dir):
+        print("Cloning YOLOv5 repository...")
+        try:
+            subprocess.run([
+                "git", "clone", "https://github.com/ultralytics/yolov5.git", yolov5_dir
+            ], check=True)
+            print("YOLOv5 repository cloned successfully")
+        except subprocess.CalledProcessError as e:
+            print(f"Error cloning YOLOv5 repository: {e}")
+            return False
+    else:
+        print("YOLOv5 repository already exists")
+    
+    # Install requirements
+    requirements_file = os.path.join(yolov5_dir, "requirements.txt")
+    if os.path.exists(requirements_file):
+        print("Installing YOLOv5 requirements...")
+        try:
+            subprocess.run([
+                sys.executable, "-m", "pip", "install", "-r", requirements_file
+            ], check=False)  # Don't fail if some packages already exist
+            print("YOLOv5 requirements installed")
+        except Exception as e:
+            print(f"Warning: Error installing requirements: {e}")
+    
+    # Add YOLOv5 to Python path
+    if yolov5_dir not in sys.path:
+        sys.path.append(yolov5_dir)
+    
+    return yolov5_dir
+
+def download_yolov5_models():
+    """Download YOLOv5 model weights"""
+    global MODELS_DOWNLOADED, YOLOV5_MODELS
     
     if MODELS_DOWNLOADED:
-        print("Models already downloaded, skipping.")
-        return YOLO_MODELS
+        print("YOLOv5 models already downloaded, skipping.")
+        return YOLOV5_MODELS
     
-    print("Downloading all required models...")
+    print("Downloading YOLOv5 models...")
     
-    # Dictionary to store models
+    # Setup YOLOv5 environment
+    yolov5_dir = setup_yolov5_environment()
+    if not yolov5_dir:
+        print("Failed to setup YOLOv5 environment")
+        return {}
+    
     models = {}
     
-    # Download YOLOv5 models
-    try:
-        for size in ['s', 'm']:
-            model_name = f"yolov5{size}"
-            print(f"Downloading {model_name}...")
-            try:
-                model = torch.hub.load('ultralytics/yolov5', model_name)
-                models[model_name] = model
-                print(f"Successfully downloaded {model_name}")
-            except Exception as e:
-                print(f"Error downloading {model_name}: {str(e)}")
-    except Exception as e:
-        print(f"Error with YOLOv5 downloads: {str(e)}")
+    # Download model weights
+    for model_name, url in YOLOV5_MODEL_URLS.items():
+        model_path = os.path.join(OUTPUT_DIR, f"{model_name}.pt")
+        
+        if os.path.exists(model_path):
+            print(f"{model_name} model already exists at {model_path}")
+        else:
+            if download_file(url, model_path):
+                print(f"Downloaded {model_name} model")
+            else:
+                print(f"Failed to download {model_name} model")
+                continue
+        
+        models[model_name] = model_path
     
     MODELS_DOWNLOADED = True
-    YOLO_MODELS = models
+    YOLOV5_MODELS = models
     
     print(f"Downloaded {len(models)} models: {list(models.keys())}")
     return models
@@ -87,7 +148,6 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
     print(f"Device: {torch.cuda.get_device_name(device)}")
-    # Print GPU memory
     print(f"Total GPU memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB")
     print(f"Free GPU memory: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
 else:
@@ -110,12 +170,10 @@ except Exception as e:
     print(f"Error loading annotations: {str(e)}")
     full_coco_data = {"images": [], "annotations": [], "categories": [{"id": 1, "name": "object"}]}
 
-# Function to filter annotations to only available images
 def prepare_available_images_dataset():
     """Filter annotations to only include available images and create new COCO file"""
-    global DATASET_PREPARED, filtered_coco_data, filtered_annot_file
+    global DATASET_PREPARED, filtered_coco_data
     
-    # Define the filtered annotations file path
     filtered_annot_file = os.path.join(OUTPUT_DIR, "filtered_annotations.json")
     
     if DATASET_PREPARED and filtered_coco_data is not None:
@@ -131,12 +189,9 @@ def prepare_available_images_dataset():
             return filtered_coco_data, filtered_annot_file
         except Exception as e:
             print(f"Error loading prepared dataset file: {str(e)}")
-            print("Will re-prepare the dataset.")
-            # Continue with preparation
     
     print("Preparing dataset with only available images...")
     
-    # Get list of all available image files in the directory
     available_files = set()
     
     if not os.path.exists(IMAGE_DIR):
@@ -144,56 +199,34 @@ def prepare_available_images_dataset():
         os.makedirs(IMAGE_DIR, exist_ok=True)
     
     print(f"Searching for images in: {IMAGE_DIR}")
-    image_count = 0
     
     # List all image files in the directory
     for root, dirs, files in os.walk(IMAGE_DIR):
         for file in files:
             if file.endswith(('.jpg', '.jpeg', '.png')):
-                image_count += 1
                 relative_path = os.path.relpath(os.path.join(root, file), IMAGE_DIR)
                 available_files.add(relative_path)
     
     print(f"Found {len(available_files)} image files in directory")
     
-    # If no images found, check if there are images in the dataset directory above
     if len(available_files) == 0:
-        print("No images found in the images directory. Checking if images exist in the data directory...")
-        for root, dirs, files in os.walk(DATA_DIR):
-            for file in files:
-                if file.endswith(('.jpg', '.jpeg', '.png')):
-                    # Found images in data directory, copy them to images directory
-                    source_path = os.path.join(root, file)
-                    dest_path = os.path.join(IMAGE_DIR, file)
-                    print(f"Copying {source_path} to {dest_path}")
-                    try:
-                        shutil.copy2(source_path, dest_path)
-                        relative_path = file
-                        available_files.add(relative_path)
-                    except Exception as e:
-                        print(f"Error copying image: {str(e)}")
-        
-        # Check the img directory if it exists
-        img_dir = os.path.join(os.getcwd(), "img")
-        if os.path.exists(img_dir):
-            print(f"Checking for images in {img_dir}...")
-            for root, dirs, files in os.walk(img_dir):
-                for file in files:
-                    if file.endswith(('.jpg', '.jpeg', '.png')):
-                        # Found images in img directory, copy them to images directory
-                        source_path = os.path.join(root, file)
-                        dest_path = os.path.join(IMAGE_DIR, file)
-                        print(f"Copying {source_path} to {dest_path}")
-                        try:
-                            shutil.copy2(source_path, dest_path)
-                            relative_path = file
-                            available_files.add(relative_path)
-                        except Exception as e:
-                            print(f"Error copying image: {str(e)}")
-                            
-        print(f"After searching additional directories, found {len(available_files)} image files")
+        print("No images found. Checking additional directories...")
+        # Check data directory and img directory like the original code
+        for check_dir in [DATA_DIR, os.path.join(os.getcwd(), "img")]:
+            if os.path.exists(check_dir):
+                print(f"Checking for images in {check_dir}...")
+                for root, dirs, files in os.walk(check_dir):
+                    for file in files:
+                        if file.endswith(('.jpg', '.jpeg', '.png')):
+                            source_path = os.path.join(root, file)
+                            dest_path = os.path.join(IMAGE_DIR, file)
+                            print(f"Copying {source_path} to {dest_path}")
+                            try:
+                                shutil.copy2(source_path, dest_path)
+                                available_files.add(file)
+                            except Exception as e:
+                                print(f"Error copying image: {str(e)}")
     
-    # Also check for files directly with their basename
     available_basenames = {os.path.basename(f) for f in available_files}
     
     # Filter images to only those available in the directory
@@ -204,9 +237,7 @@ def prepare_available_images_dataset():
         file_name = img['file_name']
         basename = os.path.basename(file_name)
         
-        # Check if file exists either by relative path or basename
         if file_name in available_files or basename in available_basenames:
-            # Update file_name to be just the basename for easier loading
             img['file_name'] = basename
             available_images.append(img)
             available_image_ids.add(img['id'])
@@ -229,7 +260,6 @@ def prepare_available_images_dataset():
     }
     
     # Save filtered annotation file
-    filtered_annot_file = os.path.join(OUTPUT_DIR, "filtered_annotations.json")
     with open(filtered_annot_file, 'w') as f:
         json.dump(filtered_coco_data, f)
     
@@ -240,212 +270,27 @@ def prepare_available_images_dataset():
 
 # Filter annotations to available images
 filtered_coco_data, filtered_annot_file = prepare_available_images_dataset()
-coco_data = filtered_coco_data  # Replace the full coco_data with filtered data
+coco_data = filtered_coco_data
 
 # Extract categories
 categories = {cat['id']: cat['name'] for cat in coco_data['categories']}
 print(f"Categories: {categories}")
 
-# Results logging function
-def log_result(model_name, metrics):
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_file = os.path.join(OUTPUT_DIR, f"{model_name}_results_{timestamp}.txt")
+def convert_coco_to_yolo_format(coco_json_path, output_dir):
+    """Convert COCO format annotations to YOLO format for YOLOv5"""
+    print(f"\nConverting COCO annotations to YOLO format: {coco_json_path}")
     
-    with open(log_file, "w") as f:
-        f.write(f"Model: {model_name}\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write("-" * 50 + "\n")
-        
-        for metric_name, value in metrics.items():
-            f.write(f"{metric_name}: {value}\n")
-    
-    print(f"Results saved to {log_file}")
-    
-    # Also append to master results file
-    master_file = os.path.join(OUTPUT_DIR, "all_results.csv")
-    metrics_df = pd.DataFrame({
-        'Model': [model_name],
-        'Timestamp': [timestamp],
-        **{k: [v] for k, v in metrics.items()}
-    })
-    
-    if os.path.exists(master_file):
-        master_df = pd.read_csv(master_file)
-        master_df = pd.concat([master_df, metrics_df], ignore_index=True)
-    else:
-        master_df = metrics_df
-    
-    master_df.to_csv(master_file, index=False)
-
-# Check if images are grayscale
-if len(coco_data['images']) > 0:
-    # Get the first available image
-    sample_img_filename = coco_data['images'][0]['file_name']
-    sample_img_path = os.path.join(IMAGE_DIR, sample_img_filename)
-    
-    # If file not found directly, try to search for it
-    if not os.path.exists(sample_img_path):
-        for root, dirs, files in os.walk(IMAGE_DIR):
-            for file in files:
-                if file == os.path.basename(sample_img_filename):
-                    sample_img_path = os.path.join(root, file)
-                    break
-    
-    if os.path.exists(sample_img_path):
-        sample_img = cv2.imread(sample_img_path)
-        if sample_img is not None:
-            print(f"Sample image shape: {sample_img.shape}")
-            # Check if image is grayscale or RGB
-            if len(sample_img.shape) == 2 or sample_img.shape[2] == 1:
-                print("Images are already in grayscale format")
-                is_grayscale = True
-            else:
-                print("Images are in RGB format, will convert to grayscale for thermal models")
-                is_grayscale = False
-        else:
-            print(f"Could not read image at {sample_img_path}")
-            is_grayscale = None
-    else:
-        print(f"Sample image not found at {sample_img_path}")
-        is_grayscale = None
-else:
-    print("No images found in the filtered dataset")
-    is_grayscale = None
-
-# Prepare train/val splits and YAML configuration
-train_annot_file = os.path.join(OUTPUT_DIR, "train_annotations.json")
-val_annot_file = os.path.join(OUTPUT_DIR, "val_annotations.json")
-yaml_file = os.path.join(OUTPUT_DIR, "thermal_dataset.yaml")
-
-# Check if files already exist
-if not (os.path.exists(train_annot_file) and os.path.exists(val_annot_file) and os.path.exists(yaml_file)):
-    # Split dataset (80% train, 20% val)
-    from sklearn.model_selection import train_test_split
-    
-    image_ids = [img['id'] for img in coco_data['images']]
-    
-    # Check if we have images to split
-    if len(image_ids) == 0:
-        print("No images found in the dataset. Creating empty train/val sets.")
-        train_ids = []
-        val_ids = []
-    else:
-        train_ids, val_ids = train_test_split(image_ids, test_size=0.2, random_state=42)
-    
-    # Create split annotation files
-    train_data = {
-        'images': [img for img in coco_data['images'] if img['id'] in train_ids],
-        'annotations': [ann for ann in coco_data['annotations'] if ann['image_id'] in train_ids],
-        'categories': coco_data['categories']
-    }
-    
-    val_data = {
-        'images': [img for img in coco_data['images'] if img['id'] in val_ids],
-        'annotations': [ann for ann in coco_data['annotations'] if ann['image_id'] in val_ids],
-        'categories': coco_data['categories']
-    }
-    
-    # Save split files
-    with open(train_annot_file, 'w') as f:
-        json.dump(train_data, f)
-    
-    with open(val_annot_file, 'w') as f:
-        json.dump(val_data, f)
-    
-    # Create YAML config - specifying the actual image directory and annotation format
-    yaml_content = f"""
-# Dataset paths
-path: {OUTPUT_DIR}  # Root directory
-
-# Directory structure
-train_dir: {IMAGE_DIR}  # Directory containing training images
-val_dir: {IMAGE_DIR}  # Directory containing validation images
-test_dir:  # Directory containing test images (optional)
-
-# Annotations (COCO format)
-train: {os.path.relpath(train_annot_file, OUTPUT_DIR)}  # Path to train annotations
-val: {os.path.relpath(val_annot_file, OUTPUT_DIR)}  # Path to validation annotations
-test:  # Path to test annotations (optional)
-
-# Single class mode - all objects are treated as class 0
-nc: 1  # Number of classes (1 for simplified single-class mode)
-names: ['object']  # Class name
-
-# Original class definitions (for reference)
-original_classes:
-  {os.linesep.join([f'  {i}: {categories[cat_id]}' for i, cat_id in enumerate(categories)])}
-"""
-    
-    with open(yaml_file, 'w') as f:
-        f.write(yaml_content)
-    
-    print(f"Dataset prepared: {len(train_ids)} training images, {len(val_ids)} validation images")
-else:
-    print("Dataset split files already exist, skipping preparation")
-    
-    # Update YAML file to include image directories even if files exist
-    if os.path.exists(yaml_file):
-        with open(yaml_file, 'r') as f:
-            yaml_content = f.read()
-        
-        if 'train_dir' not in yaml_content:
-            print("Updating YAML to include image directories")
-            yaml_content = f"""
-# Dataset paths
-path: {OUTPUT_DIR}  # Root directory
-train: {train_annot_file}  # Path to train annotations
-val: {val_annot_file}  # Path to validation annotations
-test:  # Path to test annotations (optional)
-
-# Image directory - this is critical
-train_dir: {IMAGE_DIR}  # Directory containing training images
-val_dir: {IMAGE_DIR}  # Directory containing validation images
-test_dir:  # Directory containing test images (optional)
-
-# Classes
-names:
-  {os.linesep.join([f'{i}: {categories[cat_id]}' for i, cat_id in enumerate(categories)])}
-"""
-            with open(yaml_file, 'w') as f:
-                f.write(yaml_content)
-
-# Global model performance tracker
-all_results = {}
-
-#---------------------------------------------------------------------------------
-# COCO to YOLO Conversion Helper
-#---------------------------------------------------------------------------------
-def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
-    """
-    Convert COCO format annotations to YOLO format
-    Args:
-        coco_json_path: Path to COCO JSON file
-        output_dir: Directory to save YOLO annotations
-        image_dir: Directory containing images
-    """
-    print(f"Converting COCO annotations to YOLO format: {coco_json_path}")
-    
-    # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load COCO annotations
     try:
         with open(coco_json_path, 'r') as f:
             coco_data = json.load(f)
+        print(f"Loaded COCO data with {len(coco_data['images'])} images and {len(coco_data['annotations'])} annotations")
     except Exception as e:
         print(f"Error loading COCO annotations: {str(e)}")
         return None
     
-    # Create category lookup (id -> index)
-    # Create a sequential mapping from category ID to index starting from 0
-    categories = {}
-    cat_names = []
-    for i, category in enumerate(coco_data['categories']):
-        categories[category['id']] = i  # Map each category ID to sequential index
-        cat_names.append(category['name'])
-    
-    print(f"\nCategory mapping: {categories}")
-    print(f"Number of categories: {len(categories)}")
+    # Create category mapping (always use single class for simplicity)
     print("Simplifying dataset to single class (all objects mapped to class 0)")
     
     # Get image dimensions
@@ -465,16 +310,10 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
             annotations_by_image[image_id] = []
         annotations_by_image[image_id].append(annotation)
     
-    # Track category usage
-    category_usage = {i: 0 for i in range(len(categories))}
+    print(f"\nFound annotations for {len(annotations_by_image)} images")
     
-    # Check if image files exist in the target directory
-    os.makedirs(image_dir, exist_ok=True)
-    
-    # Counts for tracking
     label_files_created = 0
     label_entries_added = 0
-    valid_image_count = 0
     
     # Convert each annotation
     for image_id, annotations in annotations_by_image.items():
@@ -484,57 +323,44 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
         img_data = image_info[image_id]
         img_width = img_data['width']
         img_height = img_data['height']
-        
-        # Get image filename
         img_filename = img_data['file_name']
-        
-        # Check for the image file in various formats
-        img_basename = os.path.splitext(img_data['file_name'])[0]
-        
-        # Get the image path
-        img_path = os.path.join(image_dir, img_filename)
+        img_basename = os.path.splitext(img_filename)[0]
         
         # Create YOLO format label file
         label_file = os.path.join(output_dir, img_basename + '.txt')
         
-        # Track if we have valid annotations for this image
         has_valid_annotations = False
         
         with open(label_file, 'w') as f:
             for annotation in annotations:
                 try:
-                    # Always use class 0 for all objects (single class mode)
-                    category_id = 0  
-                    category_usage[category_id] += 1
+                    # Always use class 0 for single class mode
+                    category_id = 0
                     
-                    # Convert bbox from [x,y,width,height] to YOLO format [x_center, y_center, width, height]
+                    # Convert bbox from [x,y,width,height] to YOLO format
                     x, y, width, height = annotation['bbox']
                     
-                    # Skip invalid boxes
                     if width <= 0 or height <= 0:
                         continue
-                        
+                    
                     # Normalize coordinates
                     x_center = (x + width / 2) / img_width
                     y_center = (y + height / 2) / img_height
                     norm_width = width / img_width
                     norm_height = height / img_height
                     
-                    # Skip invalid normalized values
                     if not (0 <= x_center <= 1 and 0 <= y_center <= 1 and 
                             0 < norm_width <= 1 and 0 < norm_height <= 1):
                         continue
                     
-                    # Write YOLO format: class_id x_center y_center width height
                     f.write(f"{category_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
                     has_valid_annotations = True
                     label_entries_added += 1
                     
                 except Exception as e:
-                    print(f"Error processing annotation: {str(e)}")
+                    print(f"Error processing annotation for image {img_filename}: {str(e)}")
                     continue
         
-        # If no valid annotations were written, remove the empty label file
         if not has_valid_annotations:
             try:
                 os.remove(label_file)
@@ -542,356 +368,348 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
                 pass
         else:
             label_files_created += 1
-            valid_image_count += 1
     
-    print(f"Category usage counts: {category_usage}")
     print(f"Created {label_files_created} label files with {label_entries_added} bounding boxes")
-    
-    # Create example images with placeholder data if needed
-    if valid_image_count == 0:
-        print("No valid labels created. Creating example placeholder images...")
-        # Create at least one example image and label for training to work
-        example_dir = os.path.join(os.path.dirname(output_dir), 'images')
-        os.makedirs(example_dir, exist_ok=True)
-        
-        # Create an example image
-        example_img = np.zeros((640, 640, 3), dtype=np.uint8)
-        example_img[200:400, 200:400, :] = 255  # White square in the middle
-        
-        # Save the example image
-        example_path = os.path.join(example_dir, 'example.jpg')
-        cv2.imwrite(example_path, example_img)
-        
-        # Create matching label file
-        example_label_path = os.path.join(output_dir, 'example.txt')
-        with open(example_label_path, 'w') as f:
-            # Object centered at (300, 300) with width/height of 200 pixels, normalized to 0-1
-            f.write(f"0 0.5 0.5 0.3125 0.3125\n")
-        
-        print(f"Created example image and label at {example_path}")
-        valid_image_count = 1
-    
-    # Create dataset.yaml file
-    yaml_path = os.path.join(os.path.dirname(output_dir), 'data.yaml')
-    
-    # Count image files
-    img_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']
-    image_count = 0
-    for ext in img_extensions:
-        image_count += len(glob.glob(os.path.join(image_dir, ext)))
-                 
-    print(f"Setting up YOLO dataset with {image_count} images...")
-    
-    # Write the YAML file
-    with open(yaml_path, 'w') as f:
-        f.write(f"# YOLO dataset configuration\n")
-        f.write(f"path: {os.path.abspath(os.path.dirname(output_dir))}\n")
-        f.write(f"train: images\n")
-        f.write(f"val: images\n")
-        f.write(f"test: images\n\n")
-        f.write(f"# Class definitions\n")
-        f.write(f"nc: 1\n")  # Always use 1 class (simplified)
-        f.write(f"names: ['object']\n")  # Simplified class name
-    
-    print(f"YOLO dataset created at {os.path.dirname(output_dir)}")
-    print(f"YAML config file: {yaml_path}")
-    
-    return yaml_path
-
-#----------------------------------------------------------------------------------
-# 1. YOLOv5 Models (s and m variants)
-#----------------------------------------------------------------------------------
+    return label_files_created > 0
 
 def test_yolov5(model_size='s'):
     """Test YOLOv5 model with specified size variant"""
     assert model_size in ['s', 'm'], "Only 's' and 'm' variants are supported"
-    global YOLO_MODELS
     
     model_name = f"yolov5{model_size}"
     yolo_output = os.path.join(OUTPUT_DIR, model_name)
     os.makedirs(yolo_output, exist_ok=True)
     
-    # Clone YOLOv5 repository if not already done
-    yolov5_dir = os.path.join(os.getcwd(), "yolov5")
-    if not os.path.exists(yolov5_dir):
-        print("Cloning YOLOv5 repository...")
-        try:
-            subprocess.run(["git", "clone", "https://github.com/ultralytics/yolov5.git", yolov5_dir], check=True)
-            print("Successfully cloned YOLOv5 repository")
-        except Exception as e:
-            print(f"Error cloning YOLOv5 repository: {str(e)}")
-            return {"mAP50": 0, "mAP50-95": 0, "Error": f"Repository setup failed: {str(e)}"}
+    # Setup YOLOv5 environment
+    yolov5_dir = setup_yolov5_environment()
+    if not yolov5_dir:
+        return {"mAP50": 0, "mAP50-95": 0, "Error": "Failed to setup YOLOv5 environment"}
     
-    # Install YOLOv5 requirements
-    requirements_file = os.path.join(yolov5_dir, "requirements.txt")
-    if os.path.exists(requirements_file):
-        print("Installing YOLOv5 requirements...")
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "-r", requirements_file], check=False)
-            print("Successfully installed YOLOv5 requirements")
-        except Exception as e:
-            print(f"Error installing YOLOv5 requirements: {str(e)}")
-            # Continue anyway, some requirements might be optional
+    # Download models
+    models = download_yolov5_models()
+    if model_name not in models:
+        return {"mAP50": 0, "mAP50-95": 0, "Error": f"Failed to download {model_name} model"}
     
-    # Create YOLO dataset
-    yolo_dataset_dir = os.path.join(yolo_output, "dataset")
-    os.makedirs(yolo_dataset_dir, exist_ok=True)
+    # Create dataset structure
+    dataset_root = os.path.join(yolo_output, "dataset")
+    os.makedirs(dataset_root, exist_ok=True)
     
-    # Get number of classes from annotations
-    with open(os.path.join(OUTPUT_DIR, "train_annotations.json"), 'r') as f:
-        coco_data = json.load(f)
-    
-    num_categories = len(coco_data['categories'])
-    print(f"Dataset has {num_categories} categories")
-    print("We will use a single-class simplified version of the dataset")
-    
-    # Simplify to a single-class problem for testing
-    num_categories = 1
-    print(f"Setting up model for {num_categories} class (simplified model)")
-    
-    # Use preloaded model if available for inference evaluation
-    if model_name in YOLO_MODELS and YOLO_MODELS[model_name] is not None:
-        print(f"Using preloaded {model_name} model for inference evaluation")
-        inference_model = YOLO_MODELS[model_name]
-    else:
-        # Load pretrained model for inference evaluation
-        try:
-            inference_model = torch.hub.load('ultralytics/yolov5', model_name)
-            print(f"Successfully loaded {model_name} for inference evaluation")
-        except Exception as e:
-            print(f"Error loading model for inference: {str(e)}")
-            inference_model = None
-    
-    # Convert dataset to YOLO format
+    # Create train and val directories
     for split in ['train', 'val']:
-        split_dir = os.path.join(yolo_dataset_dir, split)
-        images_dir = os.path.join(split_dir, "images")
-        labels_dir = os.path.join(split_dir, "labels")
-        os.makedirs(images_dir, exist_ok=True)
-        os.makedirs(labels_dir, exist_ok=True)
-        
-        # Convert annotations
-        convert_coco_to_yolo(
-            os.path.join(OUTPUT_DIR, f"{split}_annotations.json"),
-            labels_dir,
-            os.path.join(DATA_DIR, split)
-        )
-        
-        # Copy images
-        source_images = glob.glob(os.path.join(DATA_DIR, split, "*.jpg"))
-        for img_path in source_images:
-            try:
-                dest_path = os.path.join(images_dir, os.path.basename(img_path))
-                if not os.path.exists(dest_path):
-                    shutil.copy(img_path, dest_path)
-            except Exception as e:
-                print(f"Error copying image {img_path}: {str(e)}")
+        split_images = os.path.join(dataset_root, split, 'images')
+        split_labels = os.path.join(dataset_root, split, 'labels')
+        os.makedirs(split_images, exist_ok=True)
+        os.makedirs(split_labels, exist_ok=True)
     
-    # Create YAML config file - this is crucial for YOLOv5 training
-    yaml_content = f"""
-# YOLOv5 dataset config
-path: {os.path.abspath(yolo_dataset_dir)}  # dataset root
-train: train/images  # train images relative to path
-val: val/images  # val images relative to path
-test:  # test images (optional)
+    # Process annotations for train and val splits
+    print("\nProcessing annotations...")
+    for split in ['train', 'val']:
+        annot_file = os.path.join(OUTPUT_DIR, f"{split}_annotations.json")
+        
+        if not os.path.exists(annot_file):
+            print(f"Creating {split} annotations file...")
+            # Create train/val split if not exists
+            from sklearn.model_selection import train_test_split
+            
+            image_ids = [img['id'] for img in coco_data['images']]
+            if len(image_ids) == 0:
+                print("No images found in dataset")
+                continue
+            
+            train_ids, val_ids = train_test_split(image_ids, test_size=0.2, random_state=42)
+            
+            if split == 'train':
+                split_ids = train_ids
+            else:
+                split_ids = val_ids
+            
+            split_data = {
+                'images': [img for img in coco_data['images'] if img['id'] in split_ids],
+                'annotations': [ann for ann in coco_data['annotations'] if ann['image_id'] in split_ids],
+                'categories': coco_data['categories']
+            }
+            
+            with open(annot_file, 'w') as f:
+                json.dump(split_data, f)
+        
+        print(f"Processing {split} annotations from {annot_file}")
+        
+        try:
+            with open(annot_file, 'r') as f:
+                split_data = json.load(f)
+            
+            print(f"Loaded {len(split_data['images'])} images and {len(split_data['annotations'])} annotations for {split}")
+            
+            # Create image to annotation mapping
+            image_annotations = {}
+            for ann in split_data['annotations']:
+                img_id = ann['image_id']
+                if img_id not in image_annotations:
+                    image_annotations[img_id] = []
+                image_annotations[img_id].append(ann)
+            
+            # Process each image
+            for img in split_data['images']:
+                img_id = img['id']
+                img_file = img['file_name']
+                img_width = img['width']
+                img_height = img['height']
+                
+                # Source image path
+                src_img = os.path.join(IMAGE_DIR, img_file)
+                if not os.path.exists(src_img):
+                    print(f"Warning: Image not found: {src_img}")
+                    continue
+                
+                # Copy image to dataset
+                dst_img = os.path.join(dataset_root, split, 'images', img_file)
+                shutil.copy2(src_img, dst_img)
+                
+                # Create YOLO format label file
+                label_file = os.path.join(dataset_root, split, 'labels', 
+                                        os.path.splitext(img_file)[0] + '.txt')
+                
+                # Write annotations in YOLO format
+                if img_id in image_annotations:
+                    with open(label_file, 'w') as f:
+                        for ann in image_annotations[img_id]:
+                            # Get bbox coordinates
+                            x, y, w, h = ann['bbox']
+                            
+                            # Convert to YOLO format (normalized coordinates)
+                            x_center = (x + w/2) / img_width
+                            y_center = (y + h/2) / img_height
+                            width = w / img_width
+                            height = h / img_height
+                            
+                            # Always use class 0 for single class detection
+                            f.write(f"0 {x_center} {y_center} {width} {height}\n")
+            
+        except Exception as e:
+            print(f"Error processing {split} annotations: {str(e)}")
+            return {"mAP50": 0, "mAP50-95": 0, "Error": f"Annotation processing error: {str(e)}"}
+    
+    # Create YAML configuration for YOLOv5
+    yaml_content = f"""# YOLOv5 dataset configuration
+path: {os.path.abspath(dataset_root)}
+train: train/images
+val: val/images
+test: # optional
 
 # Classes
-nc: {num_categories}  # number of classes
+nc: 1  # number of classes
 names: ['object']  # class names
 """
     
-    custom_yaml = os.path.join(yolo_output, f"{model_name}_data.yaml")
-    with open(custom_yaml, 'w') as f:
+    yaml_path = os.path.join(yolo_output, 'dataset.yaml')
+    with open(yaml_path, 'w') as f:
         f.write(yaml_content)
     
-    print(f"Created custom YAML at {custom_yaml}")
+    print(f"\nCreated dataset configuration at {yaml_path}")
     
-    # Check if we have valid images to train on
-    train_images_dir = os.path.join(yolo_dataset_dir, 'train', 'images')
-    train_labels_dir = os.path.join(yolo_dataset_dir, 'train', 'labels')
-    
-    image_files = glob.glob(os.path.join(train_images_dir, '*.jpg')) + \
-                 glob.glob(os.path.join(train_images_dir, '*.jpeg')) + \
-                 glob.glob(os.path.join(train_images_dir, '*.png'))
-    
-    label_files = glob.glob(os.path.join(train_labels_dir, '*.txt'))
-    
-    print(f"Found {len(image_files)} training images and {len(label_files)} label files")
-    
-    if len(image_files) == 0 or len(label_files) == 0:
-        error_msg = "No valid training data found. Creating placeholder data."
-        print(error_msg)
-        
-        # Create a placeholder image and label
-        placeholder_img_dir = os.path.join(yolo_dataset_dir, 'train', 'images')
-        placeholder_label_dir = os.path.join(yolo_dataset_dir, 'train', 'labels')
-        os.makedirs(placeholder_img_dir, exist_ok=True)
-        os.makedirs(placeholder_label_dir, exist_ok=True)
-        
-        # Create a black image with a white box
-        placeholder_img = np.zeros((640, 640, 3), dtype=np.uint8)
-        placeholder_img[160:480, 160:480] = 255  # White box
-        
-        placeholder_img_path = os.path.join(placeholder_img_dir, 'placeholder.jpg')
-        cv2.imwrite(placeholder_img_path, placeholder_img)
-        
-        # Create a corresponding label file
-        with open(os.path.join(placeholder_label_dir, 'placeholder.txt'), 'w') as f:
-            # Format: class_id x_center y_center width height
-            f.write("0 0.5 0.5 0.5 0.5\n")  # Centered box that's 50% of image width/height
-        
-        print(f"Created placeholder training data at {placeholder_img_path}")
-        
-        # Also create for validation
-        val_img_dir = os.path.join(yolo_dataset_dir, 'val', 'images')
-        val_label_dir = os.path.join(yolo_dataset_dir, 'val', 'labels')
-        os.makedirs(val_img_dir, exist_ok=True)
-        os.makedirs(val_label_dir, exist_ok=True)
-        
-        val_img_path = os.path.join(val_img_dir, 'placeholder.jpg')
-        shutil.copy(placeholder_img_path, val_img_path)
-        
-        with open(os.path.join(val_label_dir, 'placeholder.txt'), 'w') as f:
-            f.write("0 0.5 0.5 0.5 0.5\n")
+    # Change to YOLOv5 directory for training
+    original_cwd = os.getcwd()
+    os.chdir(yolov5_dir)
     
     try:
-        # Start timing for training
-        print(f"Starting {model_name} training...")
+        print("\nStarting YOLOv5 training...")
         start_time = time.time()
         
-        # Determine batch size based on available GPU memory
-        batch_size = 16
-        if torch.cuda.is_available():
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            if gpu_mem < 6:  # Less than 6GB of VRAM
-                batch_size = 8
-                print(f"Reducing batch size to {batch_size} due to limited GPU memory")
-        else:
-            batch_size = 4
-            print("No GPU found, using small batch size")
-        
-        # Prepare the command for running YOLOv5 training
-        train_script = os.path.join(yolov5_dir, "train.py")
-        
-        if not os.path.exists(train_script):
-            print(f"Error: train.py not found at {train_script}")
-            return {"mAP50": 0, "mAP50-95": 0, "Error": "Training script not found"}
-        
-        # Build command arguments
-        cmd = [
-            sys.executable, train_script,
-            "--img", "640",                     # Image size
-            "--batch", str(batch_size),         # Batch size
-            "--epochs", "30",                   # Epochs
-            "--data", custom_yaml,              # Dataset config
-            "--weights", f"{model_name}.pt",    # Initial weights
-            "--project", yolo_output,           # Output directory
-            "--name", "train",                  # Run name
-            "--cache",                          # Cache images for faster training
-            "--single-cls",                     # Single class mode
-            "--patience", "5"                   # Early stopping patience
+        # YOLOv5 training command
+        train_cmd = [
+            sys.executable, "train.py",
+            "--data", yaml_path,
+            "--weights", models[model_name],
+            "--epochs", "30",
+            "--batch-size", "16",
+            "--img", "640",
+            "--device", "0" if torch.cuda.is_available() else "cpu",
+            "--project", yolo_output,
+            "--name", "train",
+            "--exist-ok",
+            "--single-cls",
+            "--cache",
+            "--save-period", "5",
+            "--patience", "5",
+            # Hyperparameters
+            "--hyp", "data/hyps/hyp.scratch-low.yaml",
         ]
         
-        # Add device parameter if CUDA is available
-        if torch.cuda.is_available():
-            cmd.extend(["--device", "0"])
-        else:
-            cmd.extend(["--device", "cpu"])
+        print(f"Running command: {' '.join(train_cmd)}")
         
-        # Run the training process
-        print(f"Running training with command: {' '.join(cmd)}")
+        # Run training
+        result = subprocess.run(train_cmd, capture_output=True, text=True, cwd=yolov5_dir)
         
-        # Execute the training
-        process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
+        training_time = (time.time() - start_time) / 60.0
         
-        # Track output and look for metrics
-        metrics = {"mAP50": 0, "mAP50-95": 0}
-        best_map50 = 0
-        best_map = 0
+        print(f"Training completed in {training_time:.2f} minutes")
+        print("Training stdout:", result.stdout[-1000:])  # Last 1000 chars
+        if result.stderr:
+            print("Training stderr:", result.stderr[-1000:])
         
-        for line in process.stdout:
-            print(line, end='')  # Print output in real-time
-            
-            # Look for mAP metrics in the output
-            if "all" in line and "precision" in line:
-                parts = line.strip().split()
-                try:
-                    for i, part in enumerate(parts):
-                        if part == "mAP@.5":
-                            best_map50 = float(parts[i+1])
-                            metrics["mAP50"] = best_map50
-                        elif part == "mAP@.5:.95":
-                            best_map = float(parts[i+1])
-                            metrics["mAP50-95"] = best_map
-                except Exception as e:
-                    print(f"Error parsing metrics: {str(e)}")
+        # Parse results
+        metrics = {}
         
-        # Wait for process to complete
-        process.wait()
+        # Look for results.csv or results.txt
+        results_dir = os.path.join(yolo_output, "train")
+        results_file = os.path.join(results_dir, "results.csv")
         
-        # Calculate training time
-        training_time = (time.time() - start_time) / 60.0  # minutes
-        metrics["Training Time (min)"] = training_time
-        
-        # Try to find the best model weights
-        best_weights = os.path.join(yolo_output, "train", "weights", "best.pt")
-        
-        # Calculate model parameters if possible
-        model_parameters = 0
-        if inference_model is not None:
+        if os.path.exists(results_file):
             try:
-                model_parameters = sum(p.numel() for p in inference_model.parameters() if p.requires_grad) / 1e6
+                results_df = pd.read_csv(results_file)
+                # Get the last row (final epoch results)
+                last_row = results_df.iloc[-1]
+                
+                # Extract metrics (YOLOv5 CSV format)
+                metrics["mAP50"] = float(last_row.get('val/mAP@0.5', 0))
+                metrics["mAP50-95"] = float(last_row.get('val/mAP@0.5:0.95', 0))
+                metrics["Precision"] = float(last_row.get('val/precision', 0))
+                metrics["Recall"] = float(last_row.get('val/recall', 0))
+                metrics["Box Loss"] = float(last_row.get('val/box_loss', 0))
+                
+                print(f"Extracted metrics from results.csv:")
+                print(f"mAP50: {metrics['mAP50']:.4f}")
+                print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
+                
             except Exception as e:
-                print(f"Error getting model parameters: {str(e)}")
+                print(f"Error reading results.csv: {str(e)}")
+                metrics = {
+                    "mAP50": 0,
+                    "mAP50-95": 0,
+                    "Precision": 0,
+                    "Recall": 0,
+                    "Box Loss": 0,
+                    "Error": f"Results parsing error: {str(e)}"
+                }
+        else:
+            print(f"Results file not found at {results_file}")
+            metrics = {
+                "mAP50": 0,
+                "mAP50-95": 0,
+                "Precision": 0,
+                "Recall": 0,
+                "Box Loss": 0,
+                "Error": "Results file not found"
+            }
         
-        metrics["Parameters (M)"] = model_parameters
-        metrics["GFLOPs"] = "N/A"  # Would need separate profiling code
+        # Calculate model parameters
+        try:
+            # Load the trained model to get parameters
+            best_model_path = os.path.join(results_dir, "weights", "best.pt")
+            if os.path.exists(best_model_path):
+                model_state = torch.load(best_model_path, map_location='cpu')
+                if 'model' in model_state:
+                    model_params = sum(p.numel() for p in model_state['model'].parameters())
+                    metrics["Parameters (M)"] = model_params / 1e6
+                else:
+                    metrics["Parameters (M)"] = "N/A"
+            else:
+                metrics["Parameters (M)"] = "N/A"
+        except Exception as e:
+            print(f"Error calculating parameters: {str(e)}")
+            metrics["Parameters (M)"] = "N/A"
         
-        # Estimate inference time if model is available
-        if inference_model is not None and torch.cuda.is_available():
-            # Warm up
-            img = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-            for _ in range(5):
-                inference_model(img)
-            
-            # Measure
-            t0 = time.time()
-            iterations = 50
-            for _ in range(iterations):
-                inference_model(img)
-            torch.cuda.synchronize()
-            
-            inference_time = (time.time() - t0) * 1000 / iterations  # ms
-            metrics["Inference Time (ms)"] = inference_time
-            metrics["GPU Memory (GB)"] = torch.cuda.max_memory_allocated() / 1e9
+        metrics["Training Time (min)"] = training_time
+        metrics["GFLOPs"] = "N/A"  # Would need separate profiling
+        
+        # Calculate inference time
+        if torch.cuda.is_available():
+            try:
+                # Load model for inference testing
+                import torch.nn as nn
+                sys.path.append(yolov5_dir)
+                
+                best_model_path = os.path.join(results_dir, "weights", "best.pt")
+                if os.path.exists(best_model_path):
+                    # Create dummy input
+                    dummy_input = torch.randn(1, 3, 640, 640).cuda()
+                    
+                    # Load model
+                    model = torch.load(best_model_path, map_location='cuda')['model'].float()
+                    model.eval()
+                    
+                    # Warmup
+                    for _ in range(10):
+                        with torch.no_grad():
+                            _ = model(dummy_input)
+                    
+                    torch.cuda.synchronize()
+                    
+                    # Measure inference time
+                    t0 = time.time()
+                    iterations = 50
+                    with torch.no_grad():
+                        for _ in range(iterations):
+                            _ = model(dummy_input)
+                    torch.cuda.synchronize()
+                    
+                    inference_time = (time.time() - t0) * 1000 / iterations
+                    metrics["Inference Time (ms)"] = inference_time
+                    metrics["GPU Memory (GB)"] = torch.cuda.max_memory_allocated() / 1e9
+                else:
+                    metrics["Inference Time (ms)"] = "N/A"
+                    metrics["GPU Memory (GB)"] = "N/A"
+            except Exception as e:
+                print(f"Error measuring inference time: {str(e)}")
+                metrics["Inference Time (ms)"] = "N/A"
+                metrics["GPU Memory (GB)"] = "N/A"
         else:
             metrics["Inference Time (ms)"] = "N/A"
             metrics["GPU Memory (GB)"] = "N/A"
         
+        # Save metrics to CSV
+        csv_path = os.path.join(OUTPUT_DIR, 'yolov5.csv')
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        metrics_row = {
+            'Timestamp': timestamp,
+            'Model': model_name,
+            'mAP50': metrics['mAP50'],
+            'mAP50-95': metrics['mAP50-95'],
+            'Parameters (M)': metrics['Parameters (M)'],
+            'GFLOPs': metrics['GFLOPs'],
+            'Inference Time (ms)': metrics['Inference Time (ms)'],
+            'Training Time (min)': metrics['Training Time (min)'],
+            'GPU Memory (GB)': metrics['GPU Memory (GB)'],
+            'Error': metrics.get('Error', '')
+        }
+        
+        try:
+            df = pd.read_csv(csv_path)
+        except FileNotFoundError:
+            df = pd.DataFrame(columns=metrics_row.keys())
+        
+        df = pd.concat([df, pd.DataFrame([metrics_row])], ignore_index=True)
+        df.to_csv(csv_path, index=False)
+        
+        print(f"\nMetrics saved to {csv_path}")
+        
+        # Print summary
+        print("\nTraining Summary:")
+        print(f"Model: {model_name}")
+        print(f"mAP50: {metrics['mAP50']:.4f}")
+        print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
+        print(f"Parameters (M): {metrics['Parameters (M)']}")
+        print(f"Training Time: {metrics['Training Time (min)']:.2f} minutes")
+        print(f"Inference Time: {metrics['Inference Time (ms)']} ms")
+        print(f"GPU Memory: {metrics['GPU Memory (GB)']} GB")
+        
         return metrics
-    except KeyboardInterrupt:
-        print("Training interrupted by user")
-        return {"mAP50": 0, "mAP50-95": 0, "Error": "Training interrupted by user"}
+        
     except Exception as e:
         print(f"Error during training: {str(e)}")
         traceback.print_exc()
-        return {"mAP50": 0, "mAP50-95": 0, "Error": str(e)}
+        return {"mAP50": 0, "mAP50-95": 0, "Error": f"Training error: {str(e)}"}
+    
+    finally:
+        # Always change back to original directory
+        os.chdir(original_cwd)
 
-#----------------------------------------------------------------------------------
-# Main Testing Function
-#----------------------------------------------------------------------------------
-
-def run_all_tests():
-    """Run all model tests and compile results"""
+def run_yolov5_tests():
+    """Run YOLOv5 model tests"""
     results = {}
     
-    # Test YOLOv5 models
+    # Test YOLOv5s
     try:
         print("\n--- Testing YOLOv5-s ---")
         results['YOLOv5-s'] = test_yolov5('s')
@@ -899,6 +717,7 @@ def run_all_tests():
         print(f"Error testing YOLOv5-s: {e}")
         results['YOLOv5-s'] = {"mAP50": 0, "mAP50-95": 0, "Error": str(e)}
     
+    # Test YOLOv5m
     try:
         print("\n--- Testing YOLOv5-m ---")
         results['YOLOv5-m'] = test_yolov5('m')
@@ -908,13 +727,8 @@ def run_all_tests():
     
     return results
 
-#----------------------------------------------------------------------------------
-# Results Visualization
-#----------------------------------------------------------------------------------
-
-def visualize_results(results):
-    """Create visualization of model performance"""
-    # Create DataFrame from results
+def visualize_yolov5_results(results):
+    """Create visualization of YOLOv5 model performance"""
     metrics_df = pd.DataFrame({
         'Model': list(results.keys()),
         'mAP50': [results[model].get('mAP50', 0) for model in results],
@@ -927,495 +741,127 @@ def visualize_results(results):
         'Error': [results[model].get('Error', '') for model in results]
     })
     
-    # Save to CSV first in case later visualization steps fail
-    csv_path = os.path.join(OUTPUT_DIR, 'model_comparison.csv')
+    # Save to CSV
+    csv_path = os.path.join(OUTPUT_DIR, 'yolov5_comparison.csv')
     metrics_df.to_csv(csv_path, index=False)
-    print(f"Results saved to {csv_path}")
-    
-    # Group models by architecture type
-    architecture_groups = {
-        'YOLOv5': ['YOLOv5-s', 'YOLOv5-m'],
-    }
-    
-    # Add architecture type to DataFrame
-    metrics_df['Architecture'] = metrics_df['Model'].apply(
-        lambda x: next((k for k, v in architecture_groups.items() if x in v), 'Other')
-    )
-    
-    # Check if we have valid data to visualize
-    if metrics_df.empty or metrics_df['mAP50'].max() == 0:
-        print("No valid performance metrics to visualize. Skipping visualization.")
-        return metrics_df
+    print(f"YOLOv5 results saved to {csv_path}")
     
     # Create visualizations
+    if metrics_df.empty or metrics_df['mAP50'].max() == 0:
+        print("No valid performance metrics to visualize.")
+        return metrics_df
+    
     try:
-        plt.figure(figsize=(20, 15))
+        plt.figure(figsize=(15, 10))
         
-        # 1. Accuracy (mAP50) comparison
+        # 1. Accuracy comparison
         plt.subplot(2, 2, 1)
-        bars = plt.bar(metrics_df['Model'], metrics_df['mAP50'], color=[
-            'blue' if g == 'YOLOv5' else 'green' if g == 'Transformer' else 'orange'
-            for g in metrics_df['Architecture']
-        ])
-        plt.title('mAP50 Comparison', fontsize=14)
+        bars = plt.bar(metrics_df['Model'], metrics_df['mAP50'], color='green')
+        plt.title('YOLOv5 mAP50 Comparison', fontsize=14)
         plt.ylabel('mAP50')
         plt.xticks(rotation=45, ha='right')
         plt.grid(axis='y', linestyle='--', alpha=0.7)
         
-        # Add value labels
         for bar in bars:
             height = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{height:.2f}',
-                    ha='center', va='bottom', rotation=0)
+                    f'{height:.3f}',
+                    ha='center', va='bottom')
         
-        # 2. Model Size vs. Accuracy
+        # 2. Model Size vs Accuracy
         plt.subplot(2, 2, 2)
-        for arch in architecture_groups:
-            models = architecture_groups[arch]
-            subset = metrics_df[metrics_df['Model'].isin(models)]
-            if not subset.empty:
-                plt.scatter(
-                    subset['Parameters (M)'], 
-                    subset['mAP50'],
-                    s=100, 
-                    label=arch,
-                    alpha=0.7
-                )
-                
-                # Add model names as labels
-                for i, model in enumerate(subset['Model']):
-                    plt.annotate(
-                        model,
-                        (subset['Parameters (M)'].iloc[i], subset['mAP50'].iloc[i]),
-                        textcoords="offset points",
-                        xytext=(0, 10),
-                        ha='center'
-                    )
-        
-        plt.title('Model Size vs. Accuracy', fontsize=14)
+        valid_params = [p for p in metrics_df['Parameters (M)'] if p != 'N/A']
+        if valid_params:
+            plt.scatter(metrics_df['Parameters (M)'], metrics_df['mAP50'], s=100, alpha=0.7)
+            for i, model in enumerate(metrics_df['Model']):
+                plt.annotate(model, (metrics_df['Parameters (M)'].iloc[i], metrics_df['mAP50'].iloc[i]),
+                           xytext=(5, 5), textcoords='offset points')
+        plt.title('Model Size vs Accuracy', fontsize=14)
         plt.xlabel('Parameters (M)')
         plt.ylabel('mAP50')
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend()
+        plt.grid(True, alpha=0.7)
         
-        # 3. Inference Speed vs. Accuracy
+        # 3. Training Time Comparison
         plt.subplot(2, 2, 3)
-        for arch in architecture_groups:
-            models = architecture_groups[arch]
-            subset = metrics_df[metrics_df['Model'].isin(models)]
-            if not subset.empty:
-                plt.scatter(
-                    subset['Inference Time (ms)'], 
-                    subset['mAP50'],
-                    s=100, 
-                    label=arch,
-                    alpha=0.7
-                )
-                
-                # Add model names as labels
-                for i, model in enumerate(subset['Model']):
-                    plt.annotate(
-                        model,
-                        (subset['Inference Time (ms)'].iloc[i], subset['mAP50'].iloc[i]),
-                        textcoords="offset points",
-                        xytext=(0, 10),
-                        ha='center'
-                    )
+        bars = plt.bar(metrics_df['Model'], metrics_df['Training Time (min)'], color='orange')
+        plt.title('Training Time Comparison', fontsize=14)
+        plt.ylabel('Training Time (minutes)')
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
         
-        plt.title('Inference Speed vs. Accuracy', fontsize=14)
-        plt.xlabel('Inference Time (ms)')
-        plt.ylabel('mAP50')
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend()
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.1f}',
+                    ha='center', va='bottom')
         
-        # 4. Computational Efficiency (GFLOPs vs. mAP50)
+        # 4. mAP50 vs mAP50-95
         plt.subplot(2, 2, 4)
-        for arch in architecture_groups:
-            models = architecture_groups[arch]
-            subset = metrics_df[metrics_df['Model'].isin(models)]
-            if not subset.empty and 'GFLOPs' in subset.columns:
-                valid_rows = subset[subset['GFLOPs'] != 'N/A']
-                if not valid_rows.empty:
-                    plt.scatter(
-                        valid_rows['GFLOPs'], 
-                        valid_rows['mAP50'],
-                        s=100, 
-                        label=arch,
-                        alpha=0.7
-                    )
-                    
-                    # Add model names as labels
-                    for i, model in enumerate(valid_rows['Model']):
-                        plt.annotate(
-                            model,
-                            (valid_rows['GFLOPs'].iloc[i], valid_rows['mAP50'].iloc[i]),
-                            textcoords="offset points",
-                            xytext=(0, 10),
-                            ha='center'
-                        )
-        
-        plt.title('Computational Cost vs. Accuracy', fontsize=14)
-        plt.xlabel('GFLOPs')
-        plt.ylabel('mAP50')
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend()
+        plt.scatter(metrics_df['mAP50'], metrics_df['mAP50-95'], s=100, alpha=0.7)
+        for i, model in enumerate(metrics_df['Model']):
+            plt.annotate(model, (metrics_df['mAP50'].iloc[i], metrics_df['mAP50-95'].iloc[i]),
+                       xytext=(5, 5), textcoords='offset points')
+        plt.title('mAP50 vs mAP50-95', fontsize=14)
+        plt.xlabel('mAP50')
+        plt.ylabel('mAP50-95')
+        plt.grid(True, alpha=0.7)
         
         plt.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR, 'model_comparison_charts.png'))
+        plt.savefig(os.path.join(OUTPUT_DIR, 'yolov5_comparison_charts.png'))
         plt.close()
         
-        # Create a radar chart for multi-metric comparison
-        metrics_to_plot = ['mAP50', 'Parameters (M)', 'Inference Time (ms)', 'GFLOPs']
+        print("YOLOv5 comparison charts saved")
         
-        # Select best model from each architecture for radar chart
-        best_models = []
-        for arch in architecture_groups:
-            models = architecture_groups[arch]
-            if models:
-                # Get model with highest mAP50
-                subset = metrics_df[metrics_df['Model'].isin(models)]
-                if not subset.empty and subset['mAP50'].max() > 0:
-                    best_model = subset.loc[subset['mAP50'].idxmax()]['Model']
-                    best_models.append(best_model)
-        
-        # Only create radar chart if we have models to compare
-        if best_models:
-            # Filter data for radar chart
-            radar_df = metrics_df[metrics_df['Model'].isin(best_models)]
-            
-            # Handle non-numeric values in metrics for normalization
-            radar_df_numeric = radar_df.copy()
-            for metric in metrics_to_plot:
-                radar_df_numeric[metric] = pd.to_numeric(radar_df_numeric[metric], errors='coerce')
-            
-            # Normalize metrics for radar chart
-            for metric in metrics_to_plot:
-                if metric == 'mAP50':
-                    # Higher is better
-                    max_val = radar_df_numeric[metric].max()
-                    if max_val > 0:
-                        radar_df[f'{metric}_norm'] = radar_df_numeric[metric] / max_val
-                    else:
-                        radar_df[f'{metric}_norm'] = 0
-                else:
-                    # Lower is better (invert)
-                    max_val = radar_df_numeric[metric].max()
-                    if max_val > 0:
-                        radar_df[f'{metric}_norm'] = 1 - (radar_df_numeric[metric] / max_val)
-                    else:
-                        radar_df[f'{metric}_norm'] = 0
-            
-            # Create radar chart
-            plt.figure(figsize=(10, 10))
-            from matplotlib.path import Path
-            from matplotlib.spines import Spine
-            from matplotlib.transforms import Affine2D
-            
-            # Number of variables
-            N = len(metrics_to_plot)
-            
-            # What will be the angle of each axis in the plot
-            angles = [n / float(N) * 2 * np.pi for n in range(N)]
-            angles += angles[:1]
-            
-            # Initialise the plot
-            ax = plt.subplot(111, polar=True)
-            
-            # Draw one axis per variable + add labels
-            plt.xticks(angles[:-1], metrics_to_plot, fontsize=12)
-            
-            # Draw ylabels
-            ax.set_rlabel_position(0)
-            plt.yticks([0.25, 0.5, 0.75], ["0.25", "0.5", "0.75"], color="grey", size=10)
-            plt.ylim(0, 1)
-            
-            # Plot each model
-            for i, model in enumerate(radar_df['Model']):
-                values = [radar_df[f'{metric}_norm'].iloc[i] for metric in metrics_to_plot]
-                values += values[:1]
-                ax.plot(angles, values, linewidth=2, linestyle='solid', label=model)
-                ax.fill(angles, values, alpha=0.1)
-            
-            # Add legend
-            plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
-            plt.title('Model Performance Comparison (Normalized)', fontsize=15)
-            
-            plt.savefig(os.path.join(OUTPUT_DIR, 'radar_chart_comparison.png'))
-            plt.close()
     except Exception as e:
         print(f"Error creating visualizations: {e}")
         traceback.print_exc()
     
     return metrics_df
 
-def prepare_dataset():
-    """Prepare the dataset for training and validation"""
-    global DATASET_PREPARED
-    
-    # Check if dataset files already exist
-    train_split_file = os.path.join(OUTPUT_DIR, 'train_split.txt')
-    val_split_file = os.path.join(OUTPUT_DIR, 'val_split.txt')
-    
-    # If train and validation splits already exist and flag is set, just use them
-    if DATASET_PREPARED and os.path.exists(train_split_file) and os.path.exists(val_split_file):
-        print("Dataset already prepared, skipping preparation")
-        return
-    
-    print("Preparing dataset with only available images...")
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    # Get list of available image files in the image directory
-    image_files = []
-    for ext in ['.jpg', '.jpeg', '.png']:
-        image_files.extend(glob.glob(os.path.join(DATA_DIR, '**', f'*{ext}'), recursive=True))
-    
-    print(f"Found {len(image_files)} image files in directory")
-    
-    # Load original COCO annotations
-    coco_path = os.path.join(DATA_DIR, 'annotations.json')
-    
-    try:
-        with open(coco_path, 'r') as f:
-            coco_data = json.load(f)
-    except Exception as e:
-        print(f"Error loading annotations file: {str(e)}")
-        # Generate placeholder annotations if we can't load
-        coco_data = {
-            'images': [],
-            'annotations': [],
-            'categories': [{'id': 1, 'name': 'object'}]
-        }
-    
-    # Create lookup for image ids to filenames
-    image_lookup = {}
-    for img in coco_data['images']:
-        image_lookup[img['file_name']] = img['id']
-    
-    # Filter annotations to only include those for available images
-    available_images = [os.path.basename(img) for img in image_files]
-    filtered_images = []
-    for img in coco_data['images']:
-        if img['file_name'] in available_images:
-            filtered_images.append(img)
-    
-    filtered_annotations = []
-    for ann in coco_data['annotations']:
-        image_id = ann['image_id']
-        for img in filtered_images:
-            if img['id'] == image_id:
-                filtered_annotations.append(ann)
-                break
-    
-    print(f"Filtered to {len(filtered_images)} images with annotations")
-    print(f"Keeping {len(filtered_annotations)} annotations for available images")
-    
-    # Create filtered annotation file
-    filtered_data = {
-        'images': filtered_images,
-        'annotations': filtered_annotations,
-        'categories': coco_data['categories']
-    }
-    
-    filtered_annot_file = os.path.join(OUTPUT_DIR, 'filtered_annotations.json')
-    with open(filtered_annot_file, 'w') as f:
-        json.dump(filtered_data, f)
-    
-    print(f"Created filtered annotation file with {len(filtered_images)} images")
-    
-    # Print information about categories
-    categories = {cat['id']: cat['name'] for cat in coco_data['categories']}
-    print(f"Categories: {categories}")
-    
-    # Split into train/validation sets
-    num_images = len(filtered_images)
-    if num_images == 0:
-        print("No valid images found. Please check your dataset.")
-        return
-    
-    # Show shape of a sample image to check format
-    try:
-        import cv2
-        sample_img = cv2.imread(image_files[0])
-        print(f"Sample image shape: {sample_img.shape}")
-        
-        # Check if images are grayscale or RGB
-        if sample_img.shape[2] == 3:
-            print("Images are in RGB format, will convert to grayscale for thermal models")
-        else:
-            print("Images are already in grayscale format")
-    except Exception as e:
-        print(f"Error checking image format: {str(e)}")
-    
-    # Shuffle and split images
-    np.random.seed(42)  # For reproducibility
-    indices = np.random.permutation(num_images)
-    train_size = int(0.8 * num_images)
-    
-    # Create train/val splits
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-    
-    # Create train and validation annotation files
-    train_images = [filtered_images[i] for i in train_indices]
-    val_images = [filtered_images[i] for i in val_indices]
-    
-    # Create sets of image IDs for quick lookup
-    train_image_ids = {img['id'] for img in train_images}
-    val_image_ids = {img['id'] for img in val_images}
-    
-    # Create train annotations
-    train_annotations = [ann for ann in filtered_annotations if ann['image_id'] in train_image_ids]
-    train_data = {
-        'images': train_images,
-        'annotations': train_annotations,
-        'categories': coco_data['categories']
-    }
-    
-    # Create validation annotations
-    val_annotations = [ann for ann in filtered_annotations if ann['image_id'] in val_image_ids]
-    val_data = {
-        'images': val_images,
-        'annotations': val_annotations,
-        'categories': coco_data['categories']
-    }
-    
-    # Write train/val annotation files
-    train_annot_file = os.path.join(OUTPUT_DIR, 'train_annotations.json')
-    val_annot_file = os.path.join(OUTPUT_DIR, 'val_annotations.json')
-    
-    with open(train_annot_file, 'w') as f:
-        json.dump(train_data, f)
-    
-    with open(val_annot_file, 'w') as f:
-        json.dump(val_data, f)
-    
-    # Write train/val split files with image paths
-    train_img_paths = [os.path.basename(img['file_name']) for img in train_images]
-    val_img_paths = [os.path.basename(img['file_name']) for img in val_images]
-    
-    with open(train_split_file, 'w') as f:
-        for path in train_img_paths:
-            f.write(f"{path}\n")
-    
-    with open(val_split_file, 'w') as f:
-        for path in val_img_paths:
-            f.write(f"{path}\n")
-    
-    # Create necessary directories
-    os.makedirs(os.path.join(DATA_DIR, 'train'), exist_ok=True)
-    os.makedirs(os.path.join(DATA_DIR, 'val'), exist_ok=True)
-    
-    # Copy or link images to train/val directories
-    try:
-        for img_path in image_files:
-            img_name = os.path.basename(img_path)
-            
-            if img_name in train_img_paths:
-                dest_dir = os.path.join(DATA_DIR, 'train')
-            elif img_name in val_img_paths:
-                dest_dir = os.path.join(DATA_DIR, 'val')
-            else:
-                continue
-            
-            dest_path = os.path.join(dest_dir, img_name)
-            
-            # Skip if already exists
-            if os.path.exists(dest_path):
-                continue
-            
-            try:
-                # Try to create symbolic link first (faster, uses less disk space)
-                os.symlink(img_path, dest_path)
-            except Exception:
-                # If symlink fails, copy the file
-                shutil.copy2(img_path, dest_path)
-    except Exception as e:
-        print(f"Error copying images: {str(e)}")
-        # Continue with what we have
-        
-    DATASET_PREPARED = True
-
 def main():
-    """Main function to run thermal vision model tests"""
+    """Main function to run YOLOv5 thermal vision model tests"""
     global DATASET_PREPARED, MODELS_DOWNLOADED
     
-    # Setup output directories
+    # Setup
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Check if we can use CUDA
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"Device: {torch.cuda.get_device_name(0)}")
         print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        free_mem = torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)
-        print(f"Free GPU memory: {free_mem / 1e9:.2f} GB")
     
-    # Prepare dataset - this will only run once even if called multiple times
+    # Prepare dataset
     if not DATASET_PREPARED:
-        print("\n--- Preparing dataset (will only run once) ---")
-        prepare_dataset()
+        print("\n--- Preparing dataset ---")
+        filtered_coco_data, filtered_annot_file = prepare_available_images_dataset()
         DATASET_PREPARED = True
-    else:
-        print("\n--- Dataset already prepared, skipping ---")
     
-    # Download all models at once - much more efficient than downloading individually
-    if not MODELS_DOWNLOADED:
-        print("\n--- Setting up all models (will only run once) ---")
-        models = download_all_models()
-        MODELS_DOWNLOADED = True
-        print(f"Available models: {list(models.keys())}")
-    else:
-        print("\n--- Models already downloaded, skipping ---")
+    # Run YOLOv5 tests
+    print("\n--- Running YOLOv5 Tests ---")
+    results = run_yolov5_tests()
     
-    # Define models to test
-    tests = {
-        "yolov5s": lambda: test_yolov5('s'),
-        "yolov5m": lambda: test_yolov5('m'),
-    }
-    
-    # For debugging, you can add specific models to test
-    selected_tests = ["yolov5s", "yolov5m"]  # YOLOv5 variants
-    
-    print("Running selected tests...")
-    
-    # Check if PyTorch is installed correctly
-    print("Required dependencies are installed")
-    
-    # Store results of all model tests
-    results = {}
-    
-    # Run tests
-    for model_name in selected_tests:
-        if model_name in tests:
-            try:
-                print(f"\n--- Testing {model_name.upper()} ---")
-                test_func = tests[model_name]
-                
-                # Call the test function for each model
-                model_results = test_func()
-                
-                # Save results
-                results[model_name] = model_results
-            except KeyboardInterrupt:
-                print("Testing interrupted by user")
-                break
-            except Exception as e:
-                print(f"Error testing {model_name}: {str(e)}")
-                traceback.print_exc()
-                results[model_name] = {"Error": str(e)}
-    
-    # Generate summary plot and comparison
+    # Visualize results
     if results:
         try:
-            visualize_results(results)
+            visualize_yolov5_results(results)
         except Exception as e:
             print(f"Error visualizing results: {str(e)}")
-            traceback.print_exc()
     
-    print("\nTesting complete!")
+    # Print summary
+    print("\n" + "="*50)
+    print("YOLOv5 TESTING COMPLETE")
+    print("="*50)
+    
+    for model_name, metrics in results.items():
+        print(f"\n{model_name}:")
+        print(f"  mAP50: {metrics.get('mAP50', 'N/A')}")
+        print(f"  mAP50-95: {metrics.get('mAP50-95', 'N/A')}")
+        print(f"  Parameters (M): {metrics.get('Parameters (M)', 'N/A')}")
+        print(f"  Training Time (min): {metrics.get('Training Time (min)', 'N/A')}")
+        print(f"  Inference Time (ms): {metrics.get('Inference Time (ms)', 'N/A')}")
+        if metrics.get('Error'):
+            print(f"  Error: {metrics['Error']}")
+    
     return results
 
 if __name__ == "__main__":

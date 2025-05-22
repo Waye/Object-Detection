@@ -17,6 +17,7 @@ import glob
 from tqdm import tqdm  # Using standard tqdm instead of notebook version
 import sys
 import traceback
+import yaml
 
 # Set environment variable to avoid OpenMP errors
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -25,7 +26,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 DATA_DIR = os.path.join(os.getcwd(), "data")
 OUTPUT_DIR = os.path.join(os.getcwd(), "results")
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
-ANNOTATIONS_FILE = os.path.join(os.getcwd(), "instances_train.json")  # Define annotation file path
+ANNOTATIONS_FILE = os.path.join(DATA_DIR, "annotations.json")  # Updated path to correct file
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -449,7 +450,7 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
         output_dir: Directory to save YOLO annotations
         image_dir: Directory containing images
     """
-    print(f"Converting COCO annotations to YOLO format: {coco_json_path}")
+    print(f"\nConverting COCO annotations to YOLO format: {coco_json_path}")
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -458,6 +459,7 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
     try:
         with open(coco_json_path, 'r') as f:
             coco_data = json.load(f)
+        print(f"Loaded COCO data with {len(coco_data['images'])} images and {len(coco_data['annotations'])} annotations")
     except Exception as e:
         print(f"Error loading COCO annotations: {str(e)}")
         return None
@@ -491,6 +493,8 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
             annotations_by_image[image_id] = []
         annotations_by_image[image_id].append(annotation)
     
+    print(f"\nFound annotations for {len(annotations_by_image)} images")
+    
     # Track category usage
     category_usage = {i: 0 for i in range(len(categories))}
     
@@ -505,6 +509,7 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
     # Convert each annotation
     for image_id, annotations in annotations_by_image.items():
         if image_id not in image_info:
+            print(f"Warning: No image info for image_id {image_id}")
             continue
         
         img_data = image_info[image_id]
@@ -538,6 +543,7 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
                     
                     # Skip invalid boxes
                     if width <= 0 or height <= 0:
+                        print(f"Warning: Invalid box dimensions for image {img_filename}: width={width}, height={height}")
                         continue
                         
                     # Normalize coordinates
@@ -549,6 +555,7 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
                     # Skip invalid normalized values
                     if not (0 <= x_center <= 1 and 0 <= y_center <= 1 and 
                             0 < norm_width <= 1 and 0 < norm_height <= 1):
+                        print(f"Warning: Invalid normalized coordinates for image {img_filename}: x_center={x_center}, y_center={y_center}, width={norm_width}, height={norm_height}")
                         continue
                     
                     # Write YOLO format: class_id x_center y_center width height
@@ -557,25 +564,28 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
                     label_entries_added += 1
                     
                 except Exception as e:
-                    print(f"Error processing annotation: {str(e)}")
+                    print(f"Error processing annotation for image {img_filename}: {str(e)}")
                     continue
         
         # If no valid annotations were written, remove the empty label file
         if not has_valid_annotations:
             try:
                 os.remove(label_file)
+                print(f"Removed empty label file for {img_filename}")
             except:
                 pass
         else:
             label_files_created += 1
             valid_image_count += 1
     
+    print(f"\nConversion Summary:")
     print(f"Category usage counts: {category_usage}")
     print(f"Created {label_files_created} label files with {label_entries_added} bounding boxes")
+    print(f"Valid images with annotations: {valid_image_count}")
     
     # Create example images with placeholder data if needed
     if valid_image_count == 0:
-        print("No valid labels created. Creating example placeholder images...")
+        print("\nNo valid labels created. Creating example placeholder images...")
         # Create at least one example image and label for training to work
         example_dir = os.path.join(os.path.dirname(output_dir), 'images')
         os.makedirs(example_dir, exist_ok=True)
@@ -606,7 +616,7 @@ def convert_coco_to_yolo(coco_json_path, output_dir, image_dir):
     for ext in img_extensions:
         image_count += len(glob.glob(os.path.join(image_dir, ext)))
                  
-    print(f"Setting up YOLO dataset with {image_count} images...")
+    print(f"\nSetting up YOLO dataset with {image_count} images...")
     
     # Write the YAML file
     with open(yaml_path, 'w') as f:
@@ -650,237 +660,271 @@ def test_yolov8(model_size='s'):
     yolo_output = os.path.join(OUTPUT_DIR, model_name)
     os.makedirs(yolo_output, exist_ok=True)
     
-    # Create YOLO dataset
-    yolo_dataset_dir = os.path.join(yolo_output, "dataset")
-    os.makedirs(yolo_dataset_dir, exist_ok=True)
+    # Create YOLO dataset structure
+    dataset_root = os.path.join(yolo_output, "dataset")
+    os.makedirs(dataset_root, exist_ok=True)
     
-    # Get number of classes from annotations
-    with open(os.path.join(OUTPUT_DIR, "train_annotations.json"), 'r') as f:
-        coco_data = json.load(f)
-    
-    num_categories = len(coco_data['categories'])
-    print(f"Dataset has {num_categories} categories")
-    print("We will use a single-class simplified version of the dataset")
-    
-    # Simplify to a single-class problem for testing
-    num_categories = 1
-    print(f"Modifying model for {num_categories} class (simplified model)")
-    
-    # Use preloaded model if available
-    if model_name in YOLO_MODELS and YOLO_MODELS[model_name] is not None:
-        print(f"Using preloaded {model_name} model")
-        model = YOLO_MODELS[model_name]
-    else:
-        # Load pretrained model
-        try:
-            model = YOLO(f'{model_name}.pt')  # This will automatically download if not found
-            print(f"Successfully loaded {model_name}")
-        except Exception as e:
-            print(f"Error loading model: {str(e)}")
-            print("Trying alternative loading method...")
-            try:
-                # Try loading directly from Ultralytics hub
-                model = YOLO(f'ultralytics/{model_name}')
-            except Exception as e2:
-                print(f"Failed to load model: {str(e2)}")
-                return {"mAP50": 0, "mAP50-95": 0, "Error": f"Model loading failed: {str(e2)}"}
-    
-    # Modify model to match our number of classes
-    try:
-        # YOLOv8 has a different structure than earlier versions
-        # Print the model structure to debug
-        print(f"Model structure keys: {dir(model.model)}")
-        
-        # Try different approaches to modify the class count
-        if hasattr(model.model, 'nc'):
-            model.model.nc = num_categories
-            print(f"Modified model.model.nc to {num_categories}")
-        elif hasattr(model.model, 'head') and hasattr(model.model.head, 'nc'):
-            model.model.head.nc = num_categories
-            print(f"Modified model.model.head.nc to {num_categories}")
-        else:
-            print("Could not find nc attribute to modify. Model will be modified during training.")
-    except Exception as e:
-        print(f"Error modifying model structure: {str(e)}")
-        print("Continuing with default model structure...")
-    
-    # Convert dataset to YOLO format
+    # Create train and val directories with their respective subdirectories
     for split in ['train', 'val']:
-        split_dir = os.path.join(yolo_dataset_dir, split)
-        images_dir = os.path.join(split_dir, "images")
-        labels_dir = os.path.join(split_dir, "labels")
-        os.makedirs(images_dir, exist_ok=True)
-        os.makedirs(labels_dir, exist_ok=True)
-        
-        # Convert annotations
-        convert_coco_to_yolo(
-            os.path.join(OUTPUT_DIR, f"{split}_annotations.json"),
-            labels_dir,
-            os.path.join(DATA_DIR, split)
-        )
-        
-        # Copy images
-        source_images = glob.glob(os.path.join(DATA_DIR, split, "*.jpg"))
-        for img_path in source_images:
-            shutil.copy(img_path, os.path.join(images_dir, os.path.basename(img_path)))
+        split_images = os.path.join(dataset_root, split, 'images')
+        split_labels = os.path.join(dataset_root, split, 'labels')
+        os.makedirs(split_images, exist_ok=True)
+        os.makedirs(split_labels, exist_ok=True)
     
-    # Create YAML config file
+    # Load and process annotations
+    print("\nProcessing annotations...")
+    for split in ['train', 'val']:
+        annot_file = os.path.join(OUTPUT_DIR, f"{split}_annotations.json")
+        print(f"Processing {split} annotations from {annot_file}")
+        
+        try:
+            with open(annot_file, 'r') as f:
+                split_data = json.load(f)
+            
+            print(f"Loaded {len(split_data['images'])} images and {len(split_data['annotations'])} annotations for {split}")
+            
+            # Create image to annotation mapping
+            image_annotations = {}
+            for ann in split_data['annotations']:
+                img_id = ann['image_id']
+                if img_id not in image_annotations:
+                    image_annotations[img_id] = []
+                image_annotations[img_id].append(ann)
+            
+            # Process each image
+            for img in split_data['images']:
+                img_id = img['id']
+                img_file = img['file_name']
+                img_width = img['width']
+                img_height = img['height']
+                
+                # Source image path
+                src_img = os.path.join(IMAGE_DIR, img_file)
+                if not os.path.exists(src_img):
+                    print(f"Warning: Image not found: {src_img}")
+                    continue
+                
+                # Copy image to dataset
+                dst_img = os.path.join(dataset_root, split, 'images', img_file)
+                shutil.copy2(src_img, dst_img)
+                
+                # Create YOLO format label file
+                label_file = os.path.join(dataset_root, split, 'labels', 
+                                        os.path.splitext(img_file)[0] + '.txt')
+                
+                # Write annotations in YOLO format
+                if img_id in image_annotations:
+                    with open(label_file, 'w') as f:
+                        for ann in image_annotations[img_id]:
+                            # Get bbox coordinates
+                            x, y, w, h = ann['bbox']
+                            
+                            # Convert to YOLO format (normalized coordinates)
+                            x_center = (x + w/2) / img_width
+                            y_center = (y + h/2) / img_height
+                            width = w / img_width
+                            height = h / img_height
+                            
+                            # Always use class 0 for single class detection
+                            f.write(f"0 {x_center} {y_center} {width} {height}\n")
+            
+            # Verify the conversion
+            n_images = len(glob.glob(os.path.join(dataset_root, split, 'images', '*')))
+            n_labels = len(glob.glob(os.path.join(dataset_root, split, 'labels', '*.txt')))
+            print(f"{split} set: {n_images} images, {n_labels} label files")
+            
+        except Exception as e:
+            print(f"Error processing {split} annotations: {str(e)}")
+            return {"mAP50": 0, "mAP50-95": 0, "Error": f"Annotation processing error: {str(e)}"}
+    
+    # Create YAML configuration
     yaml_content = {
-        'path': os.path.abspath(yolo_dataset_dir),
-        'train': 'train/images',
-        'val': 'val/images',
-        'train_dir': os.path.join(yolo_dataset_dir, 'train/images'),  # Explicit image directories
-        'val_dir': os.path.join(yolo_dataset_dir, 'val/images'),      # Explicit image directories
-        'nc': num_categories,
-        'names': ['object']  # All objects mapped to a single class
+        'path': os.path.abspath(dataset_root),
+        'train': os.path.join('train', 'images'),
+        'val': os.path.join('val', 'images'),
+        'nc': 1,  # Single class
+        'names': ['object']
     }
     
-    custom_yaml = os.path.join(yolo_output, f"{model_name}_data.yaml")
-    with open(custom_yaml, 'w') as f:
-        for key, value in yaml_content.items():
-            if isinstance(value, str):
-                f.write(f"{key}: '{value}'\n")
-            elif isinstance(value, list):
-                f.write(f"{key}: {value}\n")
-            else:
-                f.write(f"{key}: {value}\n")
+    yaml_path = os.path.join(yolo_output, 'dataset.yaml')
+    with open(yaml_path, 'w') as f:
+        yaml.dump(yaml_content, f, default_flow_style=False)
     
-    print(f"Created custom YAML at {custom_yaml}")
+    print(f"\nCreated dataset configuration at {yaml_path}")
     
-    # Check if we have valid images to train on
-    train_images_dir = os.path.join(yolo_dataset_dir, 'train', 'images')
-    train_labels_dir = os.path.join(yolo_dataset_dir, 'train', 'labels')
-    
-    image_files = glob.glob(os.path.join(train_images_dir, '*.jpg')) + \
-                 glob.glob(os.path.join(train_images_dir, '*.jpeg')) + \
-                 glob.glob(os.path.join(train_images_dir, '*.png'))
-    
-    label_files = glob.glob(os.path.join(train_labels_dir, '*.txt'))
-    
-    print(f"Found {len(image_files)} training images and {len(label_files)} label files")
-    
-    if len(image_files) == 0 or len(label_files) == 0:
-        error_msg = "No valid training data found. Skipping test."
-        print(error_msg)
-        return {"mAP50": 0, "mAP50-95": 0, "Error": error_msg}
-    
-    # Check if label files are valid (not empty)
-    valid_count = 0
-    for label_file in label_files:
-        try:
-            with open(label_file, 'r') as f:
-                content = f.read().strip()
-                if content:  # File has content
-                    valid_count += 1
-        except Exception as e:
-            print(f"Error reading {label_file}: {str(e)}")
-    
-    print(f"Valid label files: {valid_count}/{len(label_files)}")
-    
+    # Load or download model
     try:
-        # Count the number of classes used in the actual labels
-        actual_classes = set()
-        for label_file in glob.glob(os.path.join(train_labels_dir, '*.txt')):
-            with open(label_file, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 1:
-                        actual_classes.add(int(float(parts[0])))
-        
-        num_actual_classes = len(actual_classes)
-        print(f"Number of classes found in labels: {num_actual_classes}")
-        print(f"Classes found in labels: {sorted(actual_classes)}")
-    except Exception as e:
-        print(f"Error analyzing labels: {str(e)}")
-        num_actual_classes = 1  # Default to single class
-    
-    # We know we're using a single class mode
-    print("Using single_cls mode for training")
-    use_single_cls = True
-    
-    try:
-        # Start timing for training
-        print(f"Starting {model_name} training...")
-        start_time = time.time()
-        
-        batch_size = 16
-        if torch.cuda.is_available():
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            if gpu_mem < 6:  # Less than 6GB of VRAM
-                batch_size = 8
-                print(f"Reducing batch size to {batch_size} due to limited GPU memory")
+        if model_name in YOLO_MODELS and YOLO_MODELS[model_name] is not None:
+            model = YOLO_MODELS[model_name]
+            print(f"Using cached {model_name} model")
         else:
-            batch_size = 4
-            print("No GPU found, using small batch size")
+            model = YOLO(f'{model_name}.pt')
+            print(f"Loaded {model_name} model")
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        return {"mAP50": 0, "mAP50-95": 0, "Error": f"Model loading error: {str(e)}"}
+    
+    # Train the model
+    try:
+        print("\nStarting training...")
+        start_time = time.time()  # Start timing
         
-        # Use custom YAML with YOLO format
         results = model.train(
-            data=custom_yaml,
-            epochs=30,  # Reduce epochs for faster testing
+            data=yaml_path,
+            epochs=30,
             imgsz=640,
-            batch=batch_size,
+            batch=16,
             device=0 if torch.cuda.is_available() else 'cpu',
             project=yolo_output,
             name='train',
+            exist_ok=True,
+            pretrained=True,
+            single_cls=True,
             verbose=True,
-            patience=5,  # Reduce patience for faster early stopping
-            cache=True,  # Cache images for faster training
-            single_cls=use_single_cls,  # Use single_cls mode
-            rect=False,  # Rectangular training not used with COCO
-            resume=False,  # Don't resume from previous training
-            amp=True,  # Use mixed precision
-            seed=42  # Reproducibility
+            val=True,
+            seed=42,
+            patience=5,
+            save_period=5,
+            save=True,
+            cache=True,
+            amp=True,
+            # Training hyperparameters
+            lr0=0.01,
+            lrf=0.01,
+            momentum=0.937,
+            weight_decay=0.0005,
+            warmup_epochs=3.0,
+            warmup_momentum=0.8,
+            warmup_bias_lr=0.1,
+            box=7.5,
+            cls=0.5,
+            dfl=1.5,
+            # Data augmentation
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=0.0,
+            translate=0.1,
+            scale=0.5,
+            shear=0.0,
+            perspective=0.0,
+            flipud=0.0,
+            fliplr=0.5,
+            mosaic=1.0,
+            mixup=0.0,
+            copy_paste=0.0,
         )
         
         # Calculate training time
-        training_time = (time.time() - start_time) / 60.0  # minutes
+        training_time = (time.time() - start_time) / 60.0  # Convert to minutes
         
-        # Get best model metrics
+        # Get metrics
         metrics = {}
-        
         try:
-            best_results = model.metrics
-            metrics["mAP50"] = float(best_results.box.map50) if hasattr(best_results, 'box') else 0
-            metrics["mAP50-95"] = float(best_results.box.map) if hasattr(best_results, 'box') else 0
+            if hasattr(results, 'results_dict'):
+                metrics_dict = results.results_dict
+                print("\nTraining Results:")
+                for key, value in metrics_dict.items():
+                    print(f"{key}: {value}")
+                
+                metrics["mAP50"] = float(metrics_dict.get('metrics/mAP50(B)', 0))
+                metrics["mAP50-95"] = float(metrics_dict.get('metrics/mAP50-95(B)', 0))
+                metrics["Precision"] = float(metrics_dict.get('metrics/precision(B)', 0))
+                metrics["Recall"] = float(metrics_dict.get('metrics/recall(B)', 0))
+                metrics["Box Loss"] = float(metrics_dict.get('val/box_loss', 0))
+            else:
+                print("No metrics found in results dictionary")
+                metrics = {
+                    "mAP50": 0,
+                    "mAP50-95": 0,
+                    "Precision": 0,
+                    "Recall": 0,
+                    "Box Loss": 0,
+                    "Error": "No metrics available"
+                }
         except Exception as e:
-            print(f"Error getting model metrics: {str(e)}")
-            metrics["mAP50"] = 0
-            metrics["mAP50-95"] = 0
-            metrics["Error"] = f"Metric error: {str(e)}"
+            print(f"Error extracting metrics: {str(e)}")
+            metrics = {
+                "mAP50": 0,
+                "mAP50-95": 0,
+                "Precision": 0,
+                "Recall": 0,
+                "Box Loss": 0,
+                "Error": f"Metric extraction error: {str(e)}"
+            }
         
+        # Calculate additional metrics
         metrics["Parameters (M)"] = sum(p.numel() for p in model.model.parameters() if p.requires_grad) / 1e6
         metrics["Training Time (min)"] = training_time
-        metrics["GFLOPs"] = "N/A"  # Would need separate profiling code
+        metrics["GFLOPs"] = "N/A"  # Would need separate profiling
         
-        # Estimate inference time
+        # Calculate inference time
         if torch.cuda.is_available():
             # Warm up
             img = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
             for _ in range(5):
                 model.predict(img)
             
-            # Measure
+            # Measure inference time
             t0 = time.time()
             iterations = 50
             for _ in range(iterations):
                 model.predict(img)
             torch.cuda.synchronize()
             
-            inference_time = (time.time() - t0) * 1000 / iterations  # ms
+            inference_time = (time.time() - t0) * 1000 / iterations  # Convert to ms
             metrics["Inference Time (ms)"] = inference_time
             metrics["GPU Memory (GB)"] = torch.cuda.max_memory_allocated() / 1e9
         else:
             metrics["Inference Time (ms)"] = "N/A"
             metrics["GPU Memory (GB)"] = "N/A"
         
+        # Save metrics to yolov8.csv
+        csv_path = os.path.join(OUTPUT_DIR, 'yolov8.csv')
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Prepare metrics row
+        metrics_row = {
+            'Timestamp': timestamp,
+            'Model': model_name,
+            'mAP50': metrics['mAP50'],
+            'mAP50-95': metrics['mAP50-95'],
+            'Parameters (M)': metrics['Parameters (M)'],
+            'GFLOPs': metrics['GFLOPs'],
+            'Inference Time (ms)': metrics['Inference Time (ms)'],
+            'Training Time (min)': metrics['Training Time (min)'],
+            'GPU Memory (GB)': metrics['GPU Memory (GB)'],
+            'Error': metrics.get('Error', '')
+        }
+        
+        # Read existing CSV or create new one
+        try:
+            df = pd.read_csv(csv_path)
+        except FileNotFoundError:
+            df = pd.DataFrame(columns=metrics_row.keys())
+        
+        # Append new row
+        df = pd.concat([df, pd.DataFrame([metrics_row])], ignore_index=True)
+        
+        # Save to CSV
+        df.to_csv(csv_path, index=False)
+        print(f"\nMetrics saved to {csv_path}")
+        
+        # Print summary
+        print("\nTraining Summary:")
+        print(f"Model: {model_name}")
+        print(f"mAP50: {metrics['mAP50']:.4f}")
+        print(f"mAP50-95: {metrics['mAP50-95']:.4f}")
+        print(f"Parameters (M): {metrics['Parameters (M)']:.2f}")
+        print(f"Training Time: {metrics['Training Time (min)']:.2f} minutes")
+        print(f"Inference Time: {metrics['Inference Time (ms)']}")
+        print(f"GPU Memory: {metrics['GPU Memory (GB)']} GB")
+        
         return metrics
-    except KeyboardInterrupt:
-        print("Training interrupted by user")
-        return {"mAP50": 0, "mAP50-95": 0, "Error": "Training interrupted by user"}
+        
     except Exception as e:
         print(f"Error during training: {str(e)}")
-        traceback.print_exc()
-        return {"mAP50": 0, "mAP50-95": 0, "Error": str(e)}
+        return {"mAP50": 0, "mAP50-95": 0, "Error": f"Training error: {str(e)}"}
 
 
 #----------------------------------------------------------------------------------
@@ -1371,14 +1415,13 @@ def main():
     else:
         print("\n--- Models already downloaded, skipping ---")
     
-    # Define models to test
+    # Define models to test - only YOLOv8-small
     tests = {
         "yolov8s": lambda: test_yolov8('s'),
-        "yolov8m": lambda: test_yolov8('m'),
     }
     
     # For debugging, you can add specific models to test
-    selected_tests = ["yolov8m"]  # All YOLO variants
+    selected_tests = ["yolov8s"]  # Only YOLOv8-small
     
     print("Running selected tests...")
     

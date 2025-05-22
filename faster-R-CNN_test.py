@@ -25,7 +25,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 DATA_DIR = os.path.join(os.getcwd(), "data")
 OUTPUT_DIR = os.path.join(os.getcwd(), "results")
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
-ANNOTATIONS_FILE = os.path.join(DATA_DIR, "annotations.json")  # Define annotation file path
+ANNOTATIONS_FILE = os.path.join(DATA_DIR, "annotations.json")  # Updated path to correct file
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
