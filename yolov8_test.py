@@ -49,66 +49,6 @@ train_annot_file = os.path.join(OUTPUT_DIR, "train_annotations.json")
 val_annot_file = os.path.join(OUTPUT_DIR, "val_annotations.json")
 filtered_annot_file = os.path.join(OUTPUT_DIR, "filtered_annotations.json")
 
-# Function to download all models at once
-def download_all_models():
-    """Download all required YOLO models in advance"""
-    global MODELS_DOWNLOADED, YOLO_MODELS
-    
-    if MODELS_DOWNLOADED:
-        print("Models already downloaded, skipping.")
-        return YOLO_MODELS
-    
-    print("Downloading all required models...")
-    
-    # Ensure required packages are installed
-    try:
-        import yolov5
-        print("YOLOv5 package already installed")
-    except ImportError:
-        subprocess.run(["pip", "install", "--user", "yolov5"], check=False)
-        try:
-            import yolov5
-            print("Installed YOLOv5")
-        except ImportError:
-            print("Failed to install YOLOv5")
-    
-    try:
-        from ultralytics import YOLO
-        print("Ultralytics already installed")
-    except ImportError:
-        subprocess.run(["pip", "install", "--user", "ultralytics>=8.1.0"], check=False)
-        try:
-            from ultralytics import YOLO
-            print("Installed ultralytics")
-        except ImportError:
-            print("Failed to install ultralytics")
-    
-    # Dictionary to store models
-    models = {}
-    
-    
-    # Download YOLOv8 models
-    try:
-        from ultralytics import YOLO
-        for size in ['s', 'm']:
-            model_name = f"yolov8{size}"
-            print(f"Downloading {model_name}...")
-            try:
-                model = YOLO(f'{model_name}.pt')  # Will auto-download
-                models[model_name] = model
-                print(f"Successfully downloaded {model_name}")
-            except Exception as e:
-                print(f"Error downloading {model_name}: {str(e)}")
-    except Exception as e:
-        print(f"Error with YOLOv8 downloads: {str(e)}")
-    
-    
-    MODELS_DOWNLOADED = True
-    YOLO_MODELS = models
-    
-    print(f"Downloaded {len(models)} models: {list(models.keys())}")
-    return models
-
 # Check GPU availability
 print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -1649,14 +1589,6 @@ def main():
     else:
         print("\n--- Dataset already prepared, skipping ---")
     
-    # Download all models at once - much more efficient than downloading individually
-    if not MODELS_DOWNLOADED:
-        print("\n--- Setting up all models (will only run once) ---")
-        models = download_all_models()
-        MODELS_DOWNLOADED = True
-        print(f"Available models: {list(models.keys())}")
-    else:
-        print("\n--- Models already downloaded, skipping ---")
     
     # Define models to test - only YOLOv8-small
     tests = {
