@@ -1,0 +1,22 @@
+# Ignore data directories with images
+data/train/
+data/valid/
+data/val/
+data/test/
+
+# But allow annotation files
+!data/train/_annotations.coco.json
+!data/valid/_annotations.coco.json
+
+# Ignore all image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tif
+*.tiff
+
+# Keep specific files - replace with your actual files
+# !specificFile1.py
+# !specificFile2.py 
